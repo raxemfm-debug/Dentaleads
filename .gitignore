@@ -1,0 +1,52 @@
+# ── Secrets & environment ──────────────────────────────────────────────────
+.env
+.env.*
+!.env.example
+
+# ── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ── Virtual environments ────────────────────────────────────────────────────
+.venv/
+venv/
+env/
+
+# ── uv ─────────────────────────────────────────────────────────────────────
+.uv/
+
+# ── Testing & coverage ─────────────────────────────────────────────────────
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+
+# ── Alembic ─────────────────────────────────────────────────────────────────
+# Keep versions/ tracked; ignore only compiled cache
+alembic/__pycache__/
+alembic/versions/__pycache__/
+
+# ── Node / frontend ─────────────────────────────────────────────────────────
+node_modules/
+frontend/dist/
+frontend/.vite/
+
+# ── Docker ──────────────────────────────────────────────────────────────────
+# docker-compose overrides with local secrets
+docker-compose.override.yml
+
+# ── IDE & OS ────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
