@@ -1,7 +1,35 @@
 """
-Test fixtures. Uses SQLite in-memory for unit tests so no running Postgres is needed.
-Integration tests that require real Postgres should be marked @pytest.mark.integration.
+Test fixtures.
+
+IMPORTANT: os.environ must be populated before any app import because
+app.config.Settings() is evaluated at import time.  These dummy values
+ensure the test suite runs hermetically — no real .env file or secrets
+required, in local dev and CI alike.
 """
+import os
+
+# ---------------------------------------------------------------------------
+# Inject test defaults before any app module is imported.
+# setdefault preserves values already in the environment (e.g. CI overrides)
+# but guarantees the test suite never fails due to missing secrets.
+# ---------------------------------------------------------------------------
+_TEST_DEFAULTS: dict[str, str] = {
+    "DATABASE_URL": "postgresql+asyncpg://user:pass@localhost:5432/dentalbot_test",
+    "DATABASE_URL_SYNC": "postgresql+psycopg2://user:pass@localhost:5432/dentalbot_test",
+    "REDIS_URL": "redis://localhost:6379/0",
+    "ANTHROPIC_API_KEY": "sk-ant-test-dummy",
+    "WHATSAPP_VERIFY_TOKEN": "test-verify-token",
+    "WHATSAPP_APP_SECRET": "test-app-secret",
+    "WHATSAPP_ACCESS_TOKEN": "test-access-token",
+    "JWT_SECRET": "test-jwt-secret-for-testing-only",
+    "ENVIRONMENT": "development",
+}
+for _k, _v in _TEST_DEFAULTS.items():
+    os.environ.setdefault(_k, _v)
+
+# ---------------------------------------------------------------------------
+# App imports — safe after env is populated
+# ---------------------------------------------------------------------------
 import pytest
 import pytest_asyncio
 from httpx import ASGITransport, AsyncClient
