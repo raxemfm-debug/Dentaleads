@@ -3,7 +3,35 @@ Fake provider implementations for offline testing.
 
 These live in tests/ and are never imported by production code.
 """
-from app.core.providers import LLMMessage, LLMProvider, LLMResponse, LLMTool
+from app.core.providers import (
+    InboundMessage,
+    LLMMessage,
+    LLMProvider,
+    LLMResponse,
+    LLMTool,
+    MessagingProvider,
+    OutboundMessage,
+)
+
+
+class FakeMessagingProvider(MessagingProvider):
+    """MessagingProvider that records sent messages instead of hitting the network."""
+
+    def __init__(self) -> None:
+        self.sent: list[OutboundMessage] = []
+
+    async def send_message(self, message: OutboundMessage) -> str:
+        self.sent.append(message)
+        return "fake-wamid"
+
+    async def send_template(self, to_number: str, template_name: str, params: list[str]) -> str:
+        return "fake-wamid-template"
+
+    def parse_inbound(self, raw_payload: dict) -> list[InboundMessage]:
+        return []
+
+    def verify_signature(self, body: bytes, signature_header: str) -> bool:
+        return True
 
 
 class FakeLLMProvider(LLMProvider):
@@ -40,3 +68,29 @@ class FakeLLMProvider(LLMProvider):
         if not categories:
             raise ValueError("classify requires at least one category")
         return categories[0]
+
+
+class SpyFakeLLMProvider(FakeLLMProvider):
+    """
+    FakeLLMProvider that records every messages list passed to complete().
+
+    Use spy.calls[n] to assert on the context window sent for the nth completion.
+    """
+
+    def __init__(self) -> None:
+        self.calls: list[list[LLMMessage]] = []
+
+    async def complete(
+        self,
+        system_prompt: str,
+        messages: list[LLMMessage],
+        tools: list[LLMTool] | None = None,
+        max_tokens: int = 1024,
+    ) -> LLMResponse:
+        self.calls.append(list(messages))
+        return await super().complete(
+            system_prompt=system_prompt,
+            messages=messages,
+            tools=tools,
+            max_tokens=max_tokens,
+        )

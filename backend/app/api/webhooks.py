@@ -9,8 +9,14 @@ import logging
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import settings
+from app.core.database import get_db
+from app.core.exceptions import TenantNotFoundError
+from app.core.providers import LLMProvider
+from app.services.conversation import handle
+from app.services.llm import get_llm_provider
 from app.services.whatsapp import WhatsAppProvider
 
 logger = logging.getLogger(__name__)
@@ -45,6 +51,8 @@ async def whatsapp_challenge(
 async def whatsapp_inbound(
     request: Request,
     provider: VerifyProvider,
+    db: AsyncSession = Depends(get_db),
+    llm: LLMProvider = Depends(get_llm_provider),
 ) -> dict:
     """Receive inbound WhatsApp events; reject requests with invalid signatures."""
     body = await request.body()
@@ -65,6 +73,14 @@ async def whatsapp_inbound(
             msg.message_type,
             msg.message_id,
         )
-        # TODO(phase-1): route to conversation orchestrator
+        send_provider = WhatsAppProvider(
+            app_secret=settings.whatsapp_app_secret,
+            phone_number_id=msg.tenant_phone_id,
+            access_token=settings.whatsapp_access_token,
+        )
+        try:
+            await handle(msg=msg, db=db, messaging=send_provider, llm=llm)
+        except TenantNotFoundError:
+            logger.warning("unknown tenant phone_id=%s — skipping", msg.tenant_phone_id)
 
     return {"status": "ok"}
