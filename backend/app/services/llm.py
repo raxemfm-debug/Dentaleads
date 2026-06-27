@@ -1,19 +1,49 @@
 """
-LLM service layer.
+LLM service layer — ClaudeProvider wraps the Anthropic SDK behind LLMProvider.
 
-ClaudeProvider will live here. Until it is implemented, get_llm_provider()
-returns _PlaceholderLLMProvider — a deterministic stand-in that lets the
-webhook pipeline run end-to-end in development without touching the network.
+The provider interface keeps business logic decoupled from the SDK so the
+model or vendor can be swapped by changing this file alone.
 """
+from anthropic import AsyncAnthropic
+
+from app.config import settings
 from app.core.providers import LLMMessage, LLMProvider, LLMResponse, LLMTool
 
+_COMPLETE_MODEL = "claude-sonnet-4-6"
+_CLASSIFY_MODEL = "claude-haiku-4-5-20251001"
 
-class _PlaceholderLLMProvider(LLMProvider):
-    # TODO(deuda): delete once ClaudeProvider is implemented
-    _REPLY = (
-        "Hola, soy el asistente de la clínica. En este momento estoy en configuración; "
-        "por favor contacta directamente con nosotros."
-    )
+
+def _to_anthropic_messages(messages: list[LLMMessage]) -> list[dict]:
+    result = []
+    for msg in messages:
+        if msg.role == "tool_result":
+            result.append({
+                "role": "user",
+                "content": [{
+                    "type": "tool_result",
+                    "tool_use_id": msg.tool_call_id,
+                    "content": msg.content,
+                }],
+            })
+        else:
+            result.append({"role": msg.role, "content": msg.content})
+    return result
+
+
+def _to_anthropic_tools(tools: list[LLMTool]) -> list[dict]:
+    return [
+        {
+            "name": t.name,
+            "description": t.description,
+            "input_schema": t.input_schema,
+        }
+        for t in tools
+    ]
+
+
+class ClaudeProvider(LLMProvider):
+    def __init__(self, api_key: str) -> None:
+        self._client = AsyncAnthropic(api_key=api_key)
 
     async def complete(
         self,
@@ -22,11 +52,37 @@ class _PlaceholderLLMProvider(LLMProvider):
         tools: list[LLMTool] | None = None,
         max_tokens: int = 1024,
     ) -> LLMResponse:
+        kwargs: dict = {
+            "model": _COMPLETE_MODEL,
+            "max_tokens": max_tokens,
+            "system": system_prompt,
+            "messages": _to_anthropic_messages(messages),
+        }
+        if tools:
+            kwargs["tools"] = _to_anthropic_tools(tools)
+
+        response = await self._client.messages.create(**kwargs)
+
+        content_text = ""
+        tool_calls: list[dict] = []
+        for block in response.content:
+            if block.type == "text":
+                content_text += block.text
+            elif block.type == "tool_use":
+                tool_calls.append({
+                    "id": block.id,
+                    "name": block.name,
+                    "inputs": block.input,
+                })
+
         return LLMResponse(
-            content=self._REPLY,
-            tool_calls=[],
-            stop_reason="end_turn",
-            usage={"input_tokens": 0, "output_tokens": 0},
+            content=content_text,
+            tool_calls=tool_calls,
+            stop_reason=response.stop_reason,
+            usage={
+                "input_tokens": response.usage.input_tokens,
+                "output_tokens": response.usage.output_tokens,
+            },
         )
 
     async def classify(
@@ -37,9 +93,25 @@ class _PlaceholderLLMProvider(LLMProvider):
     ) -> str:
         if not categories:
             raise ValueError("classify requires at least one category")
+
+        categories_list = ", ".join(f'"{c}"' for c in categories)
+        system = system_prompt or (
+            f"Classify the following text into exactly one of these categories: {categories_list}. "
+            "Respond with only the category name, no explanation."
+        )
+        response = await self._client.messages.create(
+            model=_CLASSIFY_MODEL,
+            max_tokens=64,
+            system=system,
+            messages=[{"role": "user", "content": text}],
+        )
+
+        raw = response.content[0].text.strip()
+        for cat in categories:
+            if cat.lower() in raw.lower():
+                return cat
         return categories[0]
 
 
 def get_llm_provider() -> LLMProvider:
-    # TODO(deuda): return ClaudeProvider(settings.anthropic_api_key) once implemented
-    return _PlaceholderLLMProvider()
+    return ClaudeProvider(api_key=settings.anthropic_api_key)

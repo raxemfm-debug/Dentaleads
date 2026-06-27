@@ -71,8 +71,9 @@ class LLMTool:
 
 @dataclass
 class LLMMessage:
-    role: str   # user | assistant | system
+    role: str   # user | assistant | system | tool_result
     content: str
+    tool_call_id: str | None = None  # required when role == "tool_result"
 
 
 @dataclass

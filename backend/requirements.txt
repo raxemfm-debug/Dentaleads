@@ -22,3 +22,6 @@ redis==5.2.1
 
 # HTTP client (for WhatsApp API calls)
 httpx==0.28.1
+
+# LLM provider
+anthropic>=0.40
