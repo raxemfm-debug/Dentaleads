@@ -25,6 +25,20 @@ def _to_anthropic_messages(messages: list[LLMMessage]) -> list[dict]:
                     "content": msg.content,
                 }],
             })
+        elif msg.role == "assistant" and msg.tool_calls:
+            # Anthropic requires a content array when the assistant turn contains tool_use
+            # blocks. Plain-string content is not valid in this case.
+            content_blocks: list[dict] = []
+            if msg.content:
+                content_blocks.append({"type": "text", "text": msg.content})
+            for tc in msg.tool_calls:
+                content_blocks.append({
+                    "type": "tool_use",
+                    "id": tc["id"],
+                    "name": tc["name"],
+                    "input": tc["inputs"],
+                })
+            result.append({"role": "assistant", "content": content_blocks})
         else:
             result.append({"role": msg.role, "content": msg.content})
     return result

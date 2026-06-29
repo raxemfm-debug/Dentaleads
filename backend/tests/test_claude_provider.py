@@ -201,6 +201,44 @@ class TestComplete:
         }
 
     @pytest.mark.asyncio
+    async def test_assistant_with_tool_calls_serialized_as_content_array(self, provider, mock_client):
+        """An assistant turn with tool_calls must be sent as a content-block array, not a plain string."""
+        mock_client.messages.create.return_value = _make_response(
+            content_blocks=[_text_block("OK")]
+        )
+        messages = [
+            LLMMessage(role="user", content="¿Tienen citas mañana?"),
+            LLMMessage(
+                role="assistant",
+                content="Voy a verificar.",
+                tool_calls=[{
+                    "id": "toolu_1",
+                    "name": "verificar_disponibilidad",
+                    "inputs": {"fecha": "2026-07-01"},
+                }],
+            ),
+            LLMMessage(
+                role="tool_result",
+                content='{"slots": ["10:00"]}',
+                tool_call_id="toolu_1",
+            ),
+        ]
+        await provider.complete(system_prompt="S", messages=messages)
+        sent = mock_client.messages.create.call_args.kwargs["messages"]
+        assert sent[1] == {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "Voy a verificar."},
+                {
+                    "type": "tool_use",
+                    "id": "toolu_1",
+                    "name": "verificar_disponibilidad",
+                    "input": {"fecha": "2026-07-01"},
+                },
+            ],
+        }
+
+    @pytest.mark.asyncio
     async def test_multi_text_blocks_concatenated(self, provider, mock_client):
         mock_client.messages.create.return_value = _make_response(
             content_blocks=[_text_block("Hola "), _text_block("mundo")],

@@ -70,6 +70,45 @@ class FakeLLMProvider(LLMProvider):
         return categories[0]
 
 
+class SequencedFakeLLMProvider(LLMProvider):
+    """Returns LLMResponse objects from a provided list in order.
+
+    After the list is exhausted the last response repeats indefinitely.
+    Records every call as a dict {system_prompt, messages, tools} for assertions.
+    """
+
+    def __init__(self, responses: list[LLMResponse]) -> None:
+        self._responses = responses
+        self._idx = 0
+        self.calls: list[dict] = []
+
+    async def complete(
+        self,
+        system_prompt: str,
+        messages: list[LLMMessage],
+        tools: list[LLMTool] | None = None,
+        max_tokens: int = 1024,
+    ) -> LLMResponse:
+        self.calls.append({
+            "system_prompt": system_prompt,
+            "messages": list(messages),
+            "tools": tools,
+        })
+        response = self._responses[min(self._idx, len(self._responses) - 1)]
+        self._idx += 1
+        return response
+
+    async def classify(
+        self,
+        text: str,
+        categories: list[str],
+        system_prompt: str | None = None,
+    ) -> str:
+        if not categories:
+            raise ValueError("classify requires at least one category")
+        return categories[0]
+
+
 class SpyFakeLLMProvider(FakeLLMProvider):
     """
     FakeLLMProvider that records every messages list passed to complete().

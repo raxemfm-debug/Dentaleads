@@ -271,6 +271,16 @@ Este proyecto está diseñado para **durar y crecer indefinidamente**: el códig
 
 ---
 
+## 15. Deuda técnica conocida
+
+Atajos deliberados marcados con `# TODO(deuda):` en el código. Registrar aquí para visibilidad entre sesiones.
+
+| ID | Archivo | Descripción | Impacto |
+|----|---------|-------------|---------|
+| DT-001 | `app/services/conversation.py` (paso 8) | Los intercambios intermedios del loop de tool-calling (turnos `tool_use` + `tool_results`) no se persisten; solo se guarda la respuesta final de texto. | Dificulta la depuración de conversaciones fallidas y la auditoría del comportamiento del bot en producción. Post-MVP: persistir el rastro completo con `role="tool_use"/"tool_result"` y `metadata_` con inputs/outputs. |
+
+---
+
 *Fin de CLAUDE.md — mantener este documento actualizado a medida que el producto evoluciona.*
 
     

@@ -16,6 +16,7 @@ from app.core.providers import (
     InboundMessage,
     LLMMessage,
     LLMProvider,
+    LLMResponse,
     MessagingProvider,
     OutboundMessage,
 )
@@ -23,10 +24,12 @@ from app.models.clinic import Clinic
 from app.models.conversation import Conversation
 from app.models.lead import Lead
 from app.models.message import Message
+from app.services.tools import DENTAL_TOOLS, DISPATCHER, ToolContext, ToolDispatcher
 
 logger = logging.getLogger(__name__)
 
 HISTORY_LIMIT = 20
+MAX_TOOL_ITERATIONS = 5
 
 _DEFAULT_SYSTEM = (
     "Eres el asistente virtual de {clinic_name}, una clínica dental. "
@@ -98,6 +101,53 @@ async def _get_or_create_conversation(
     return conv
 
 
+async def _run_llm_loop(
+    llm: LLMProvider,
+    system_prompt: str,
+    messages: list[LLMMessage],
+    dispatcher: ToolDispatcher,
+    ctx: ToolContext,
+) -> LLMResponse:
+    """Run the agentic tool-calling loop.
+
+    Calls llm.complete() repeatedly while stop_reason == "tool_use", executing
+    each requested tool via the dispatcher and injecting results back into the
+    message list.  Caps at MAX_TOOL_ITERATIONS and forces a final text-only
+    completion as a safety fallback.
+    """
+    for _ in range(MAX_TOOL_ITERATIONS):
+        response = await llm.complete(
+            system_prompt=system_prompt,
+            messages=messages,
+            tools=DENTAL_TOOLS,
+        )
+        if response.stop_reason != "tool_use" or not response.tool_calls:
+            return response
+
+        # Replay the assistant's tool_use turn back into the message list so
+        # subsequent calls see a valid alternating user/assistant sequence.
+        messages.append(LLMMessage(
+            role="assistant",
+            content=response.content,
+            tool_calls=response.tool_calls,
+        ))
+
+        for call in response.tool_calls:
+            result = await dispatcher.dispatch(call["name"], call["inputs"], ctx)
+            messages.append(LLMMessage(
+                role="tool_result",
+                content=result,
+                tool_call_id=call["id"],
+            ))
+
+    # Safety fallback: expose no tools so the model is forced to emit end_turn.
+    logger.warning(
+        "tool loop capped at MAX_TOOL_ITERATIONS=%d, forcing final completion",
+        MAX_TOOL_ITERATIONS,
+    )
+    return await llm.complete(system_prompt=system_prompt, messages=messages, tools=None)
+
+
 async def handle(
     msg: InboundMessage,
     db: AsyncSession,
@@ -156,8 +206,15 @@ async def handle(
     inbound_text = msg.text or ""
     llm_messages.append(LLMMessage(role="user", content=inbound_text))
 
-    # 7. Call LLM
-    response = await llm.complete(system_prompt=system_prompt, messages=llm_messages)
+    # 7. Run the agentic tool-calling loop
+    ctx = ToolContext(db=db, clinic=clinic, conv=conv, lead=lead)
+    response = await _run_llm_loop(llm, system_prompt, llm_messages, DISPATCHER, ctx)
+
+    # TODO(deuda): los intercambios intermedios del loop (turnos assistant tool_use +
+    # tool_results) no se persisten; solo se guarda la respuesta final de texto.
+    # Post-MVP: persistir el rastro completo de tool calls en la tabla messages
+    # (con role="tool_use" / "tool_result" y metadata_ con inputs/outputs) para
+    # facilitar la depuración de conversaciones y la auditoría del comportamiento del bot.
 
     # 8. Persist inbound + assistant response together, then refresh conversation timestamp
     db.add(

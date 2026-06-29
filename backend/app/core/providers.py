@@ -71,9 +71,10 @@ class LLMTool:
 
 @dataclass
 class LLMMessage:
-    role: str   # user | assistant | system | tool_result
+    role: str   # user | assistant | tool_result
     content: str
-    tool_call_id: str | None = None  # required when role == "tool_result"
+    tool_call_id: str | None = None   # required when role == "tool_result"
+    tool_calls: list[dict] | None = None  # set on assistant turns that invoked tools
 
 
 @dataclass
