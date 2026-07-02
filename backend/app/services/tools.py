@@ -6,8 +6,11 @@ ToolContext   — per-request context threaded through each handler.
 ToolDispatcher — registry: tool name → async handler.  dispatch() never raises;
                  errors are contained and returned as JSON so the model can react.
 
-verificar_disponibilidad — real implementation (AvailabilityService).
-Remaining 4 handlers are stubs to be replaced in subsequent tasks.
+All 5 tools have real implementations. agendar_cita guards against double
+booking with a SAVEPOINT (db.begin_nested()) around the insert: on
+IntegrityError from uq_appointments_tenant_slot it rolls back just the
+savepoint (the outer session/transaction stays usable) and returns
+free alternatives for the same day instead of propagating the error.
 """
 import json
 import logging
@@ -16,14 +19,16 @@ from datetime import datetime, timezone
 from typing import Awaitable, Callable
 
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.providers import LLMTool
+from app.models.appointment import Appointment
 from app.models.clinic import Clinic
 from app.models.conversation import Conversation
 from app.models.lead import Lead
 from app.models.treatment import Treatment
-from app.services.availability import AvailabilityService
+from app.services.availability import AvailabilityService, resolve_clinic_timezone
 
 logger = logging.getLogger(__name__)
 
@@ -181,14 +186,78 @@ async def _handle_derivar_a_humano(ctx: ToolContext, inputs: dict) -> str:
     return json.dumps({"status": "handoff_requested", "motivo": inputs.get("motivo", "")}, ensure_ascii=False)
 
 
-# ---------------------------------------------------------------------------
-# Stub handler — TODO(stub): replace with real implementation in Lote 2
-# ---------------------------------------------------------------------------
+async def _handle_agendar_cita(ctx: ToolContext, inputs: dict) -> str:
+    fecha_hora_str: str = inputs.get("fecha_hora", "")
+    tratamiento_nombre: str = inputs.get("tratamiento", "")
+    nombre_paciente: str | None = inputs.get("nombre_paciente")
 
-async def _stub_agendar_cita(ctx: ToolContext, inputs: dict) -> str:
-    # TODO(stub): insert appointment row with double-booking guard (design pending)
-    logger.debug("stub agendar_cita inputs=%s", inputs)
-    return json.dumps({"status": "scheduled", "appointment_id": "stub-001"})
+    try:
+        tz = resolve_clinic_timezone(ctx.clinic)
+    except ValueError:
+        logger.error("clinic %s has invalid timezone: %s", ctx.clinic.id, ctx.clinic.timezone)
+        return json.dumps({"status": "fecha_invalida"}, ensure_ascii=False)
+
+    try:
+        naive = datetime.fromisoformat(fecha_hora_str)
+    except (ValueError, TypeError):
+        return json.dumps({"status": "fecha_invalida"}, ensure_ascii=False)
+    # fecha_hora carries no offset per the tool's contract, so naive.date()
+    # already *is* the tenant's local day — reused as-is for alternatives,
+    # independent of whatever scheduled_at ends up looking like.
+    local_date_str = naive.date().isoformat()
+    scheduled_at = naive.replace(tzinfo=tz) if naive.tzinfo is None else naive.astimezone(tz)
+
+    treatment = (
+        await ctx.db.execute(
+            select(Treatment)
+            .where(Treatment.tenant_id == ctx.clinic.id)
+            .where(func.lower(Treatment.name) == tratamiento_nombre.lower())
+            .where(Treatment.is_active.is_(True))
+            .limit(1)
+        )
+    ).scalars().first()
+
+    aviso: str | None = None
+    if treatment is None:
+        # Appointment.treatment_id is nullable (ondelete="SET NULL"), so an
+        # unrecognized name doesn't block scheduling — flag it instead.
+        aviso = (
+            f"No se encontró el tratamiento '{tratamiento_nombre}' en el catálogo; "
+            "la cita se agendó sin tratamiento vinculado. Usa consultar_tratamiento "
+            "para confirmar el nombre exacto."
+        )
+
+    if nombre_paciente:
+        ctx.lead.name = nombre_paciente
+        if ctx.lead.consent_at is None:
+            ctx.lead.consent_at = datetime.now(tz=timezone.utc)
+
+    appointment = Appointment(
+        tenant_id=ctx.clinic.id,
+        lead_id=ctx.lead.id,
+        treatment_id=treatment.id if treatment else None,
+        scheduled_at=scheduled_at,
+        status="confirmed",
+    )
+
+    try:
+        async with ctx.db.begin_nested():
+            ctx.db.add(appointment)
+            await ctx.db.flush()
+    except IntegrityError:
+        # solo revierte al savepoint; la sesión sigue viva
+        alternativas = await AvailabilityService.get_available_slots(
+            ctx.db, ctx.clinic, local_date_str
+        )
+        return json.dumps(
+            {"status": "slot_no_disponible", "alternativas": alternativas.get("slots", [])},
+            ensure_ascii=False,
+        )
+
+    result: dict = {"status": "scheduled", "appointment_id": str(appointment.id)}
+    if aviso:
+        result["aviso"] = aviso
+    return json.dumps(result, ensure_ascii=False)
 
 
 # ---------------------------------------------------------------------------
@@ -224,7 +293,7 @@ class ToolDispatcher:
 def _make_dispatcher() -> ToolDispatcher:
     d = ToolDispatcher()
     d.register("verificar_disponibilidad", _handle_verificar_disponibilidad)
-    d.register("agendar_cita", _stub_agendar_cita)
+    d.register("agendar_cita", _handle_agendar_cita)
     d.register("guardar_lead", _handle_guardar_lead)
     d.register("consultar_tratamiento", _handle_consultar_tratamiento)
     d.register("derivar_a_humano", _handle_derivar_a_humano)

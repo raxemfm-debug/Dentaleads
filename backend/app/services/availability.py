@@ -33,6 +33,19 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SLOT_MINUTES = 30
 
 
+def resolve_clinic_timezone(clinic: Clinic) -> ZoneInfo:
+    """Resolve a clinic's IANA timezone (stdlib zoneinfo, not pytz).
+
+    Raises ValueError if clinic.timezone is missing/unknown so callers can
+    map it to their own "fecha_invalida"-style response.
+    """
+    tz_str = clinic.timezone or "UTC"
+    try:
+        return ZoneInfo(tz_str)
+    except (ZoneInfoNotFoundError, KeyError) as exc:
+        raise ValueError(f"invalid timezone for clinic {clinic.id}: {tz_str}") from exc
+
+
 @dataclass(frozen=True)
 class BookedSlot:
     """A single occupied interval, always timezone-aware."""
@@ -163,8 +176,8 @@ class AvailabilityService:
             return {"disponible": False, "motivo": "fecha_invalida"}
 
         try:
-            tz = ZoneInfo(tz_str)
-        except (ZoneInfoNotFoundError, KeyError):
+            tz = resolve_clinic_timezone(clinic)
+        except ValueError:
             return {"disponible": False, "motivo": "fecha_invalida"}
 
         today = datetime.now(tz=tz).date()

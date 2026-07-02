@@ -19,12 +19,14 @@ from decimal import Decimal
 import pytest
 import pytest_asyncio
 
+from app.models.appointment import Appointment
 from app.models.clinic import Clinic
 from app.models.conversation import Conversation
 from app.models.lead import Lead
 from app.models.treatment import Treatment
 from app.services.tools import (
     ToolContext,
+    _handle_agendar_cita,
     _handle_consultar_tratamiento,
     _handle_derivar_a_humano,
     _handle_guardar_lead,
@@ -302,3 +304,157 @@ class TestDerivarAHumano:
         assert result["motivo"] == ""
         await db_session.refresh(conv)
         assert conv.status == "human"
+
+
+# ---------------------------------------------------------------------------
+# agendar_cita
+# ---------------------------------------------------------------------------
+
+# Monday with a morning + evening range, matching test_availability.py's
+# BH_STANDARD shape. 2026-07-06 is a Monday.
+_BH_LIMA = {
+    "slot_duration_minutes": 30,
+    "days": {
+        "monday":    [{"from": "09:00", "to": "14:00"}, {"from": "16:00", "to": "20:00"}],
+        "tuesday":   [{"from": "09:00", "to": "14:00"}],
+        "wednesday": [{"from": "09:00", "to": "14:00"}],
+        "thursday":  [{"from": "09:00", "to": "14:00"}],
+        "friday":    [{"from": "09:00", "to": "14:00"}],
+        "saturday":  [],
+        "sunday":    [],
+    },
+}
+
+
+@pytest_asyncio.fixture
+async def lead2(db_session, clinic):
+    l = Lead(tenant_id=clinic.id, whatsapp_number="+51999000002", source="whatsapp", status="new")
+    db_session.add(l)
+    await db_session.flush()
+    await db_session.refresh(l)
+    return l
+
+
+class TestAgendarCita:
+    async def test_schedules_appointment_and_persists_row(self, db_session, clinic, lead, conv, treatment):
+        ctx = _ctx(db_session, clinic, conv, lead)
+        result = json.loads(
+            await _handle_agendar_cita(
+                ctx, {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Limpieza Dental"}
+            )
+        )
+
+        assert result["status"] == "scheduled"
+        assert "aviso" not in result
+
+        row = await db_session.get(Appointment, uuid.UUID(result["appointment_id"]))
+        assert row.tenant_id == clinic.id
+        assert row.lead_id == lead.id
+        assert row.treatment_id == treatment.id
+        assert row.status == "confirmed"
+
+    async def test_sets_patient_name_and_consent(self, db_session, clinic, lead, conv, treatment):
+        assert lead.consent_at is None
+        ctx = _ctx(db_session, clinic, conv, lead)
+        await _handle_agendar_cita(
+            ctx,
+            {
+                "fecha_hora": "2026-07-06T10:00",
+                "tratamiento": "Limpieza Dental",
+                "nombre_paciente": "Ana García",
+            },
+        )
+
+        await db_session.refresh(lead)
+        assert lead.name == "Ana García"
+        assert lead.consent_at is not None
+
+    async def test_unknown_treatment_schedules_with_none_and_aviso(self, db_session, clinic, lead, conv):
+        ctx = _ctx(db_session, clinic, conv, lead)
+        result = json.loads(
+            await _handle_agendar_cita(
+                ctx, {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Cirugía Marciana"}
+            )
+        )
+
+        assert result["status"] == "scheduled"
+        assert "no se encontró" in result["aviso"].lower()
+        assert "consultar_tratamiento" in result["aviso"]
+
+        row = await db_session.get(Appointment, uuid.UUID(result["appointment_id"]))
+        assert row.treatment_id is None
+
+    async def test_invalid_fecha_hora_returns_fecha_invalida(self, db_session, clinic, lead, conv, treatment):
+        ctx = _ctx(db_session, clinic, conv, lead)
+        result = json.loads(
+            await _handle_agendar_cita(
+                ctx, {"fecha_hora": "not-a-datetime", "tratamiento": "Limpieza Dental"}
+            )
+        )
+
+        assert result["status"] == "fecha_invalida"
+
+    async def test_rejects_double_booking_and_offers_alternativas(
+        self, db_session, clinic, lead, lead2, conv, treatment
+    ):
+        ctx1 = _ctx(db_session, clinic, conv, lead)
+        first = json.loads(
+            await _handle_agendar_cita(
+                ctx1, {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Limpieza Dental"}
+            )
+        )
+        assert first["status"] == "scheduled"
+
+        ctx2 = _ctx(db_session, clinic, conv, lead2)
+        second = json.loads(
+            await _handle_agendar_cita(
+                ctx2, {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Limpieza Dental"}
+            )
+        )
+
+        assert second["status"] == "slot_no_disponible"
+        assert isinstance(second["alternativas"], list)
+
+        # Savepoint rollback must leave the session usable for further queries.
+        row = await db_session.get(Appointment, uuid.UUID(first["appointment_id"]))
+        assert row is not None
+
+    async def test_conflict_at_lima_20h_offers_alternatives_for_same_local_day(
+        self, db_session, clinic, lead, lead2, conv, treatment
+    ):
+        """Regression/invariant test for the day-boundary case: a clash at
+        20:00 America/Lima (UTC-5) is 01:00 UTC the *next* calendar day.
+        Alternatives must be computed for the tenant's local day (2026-07-06),
+        not the UTC day (2026-07-07), or the bot would offer slots for the
+        wrong day after a collision.
+
+        Note: this does NOT regress against a naive `scheduled_at.date()`
+        implementation either — Python's `datetime.date()` does not normalize
+        to UTC, so both approaches already agree here. It's kept as an
+        explicit invariant check for this boundary case, not a before/after
+        regression test.
+        """
+        clinic.timezone = "America/Lima"
+        clinic.business_hours = _BH_LIMA
+        await db_session.flush()
+
+        ctx1 = _ctx(db_session, clinic, conv, lead)
+        first = json.loads(
+            await _handle_agendar_cita(
+                ctx1, {"fecha_hora": "2026-07-06T20:00", "tratamiento": "Limpieza Dental"}
+            )
+        )
+        assert first["status"] == "scheduled"
+
+        ctx2 = _ctx(db_session, clinic, conv, lead2)
+        second = json.loads(
+            await _handle_agendar_cita(
+                ctx2, {"fecha_hora": "2026-07-06T20:00", "tratamiento": "Limpieza Dental"}
+            )
+        )
+
+        assert second["status"] == "slot_no_disponible"
+        alternativas = second["alternativas"]
+        assert len(alternativas) > 0
+        assert all(slot.startswith("2026-07-06T") for slot in alternativas)
+        assert not any(slot.startswith("2026-07-07T") for slot in alternativas)
