@@ -275,9 +275,11 @@ Este proyecto está diseñado para **durar y crecer indefinidamente**: el códig
 
 Atajos deliberados marcados con `# TODO(deuda):` en el código. Registrar aquí para visibilidad entre sesiones.
 
-| ID | Archivo | Descripción | Impacto |
-|----|---------|-------------|---------|
-| DT-001 | `app/services/conversation.py` (paso 8) | Los intercambios intermedios del loop de tool-calling (turnos `tool_use` + `tool_results`) no se persisten; solo se guarda la respuesta final de texto. | Dificulta la depuración de conversaciones fallidas y la auditoría del comportamiento del bot en producción. Post-MVP: persistir el rastro completo con `role="tool_use"/"tool_result"` y `metadata_` con inputs/outputs. |
+| ID | Archivo | Descripción | Impacto | Estado |
+|----|---------|-------------|---------|--------|
+| DT-001 | `app/services/conversation.py` (paso 8) | Los intercambios intermedios del loop de tool-calling (turnos `tool_use` + `tool_results`) no se persisten; solo se guarda la respuesta final de texto. | Dificulta la depuración de conversaciones fallidas y la auditoría del comportamiento del bot en producción. Post-MVP: persistir el rastro completo con `role="tool_use"/"tool_result"` y `metadata_` con inputs/outputs. | Abierta |
+| DT-002 | `backend/Dockerfile` / imagen `api` | La imagen Docker de `api` quedó desactualizada respecto a `requirements.txt`: `anthropic` se agregó al manifiesto el 2026-06-27 pero la imagen no se reconstruyó, así que el contenedor entraba en crash-loop con `ModuleNotFoundError: No module named 'anthropic'`. No fue un problema de manifiesto — `requirements.txt` ya estaba correcto — sino de una imagen sin rebuild. | Bloqueaba cualquier prueba end-to-end, incluida la integración real con WhatsApp Cloud API. Detectado y resuelto el 2026-07-02 con `docker compose up -d --build api`. Recordatorio: tras tocar `requirements.txt` hace falta `--build`, un `restart` o `up -d` sin `--build` no alcanza. | **Resuelta** (2026-07-02) |
+| DT-003 | `app/services/conversation.py` `handle()` | La llamada al SDK de Anthropic (vía `ClaudeProvider`) no está envuelta en try/except. Un error del proveedor (rate limit, auth, timeout) se propaga sin capturar hasta el router del webhook (`app/api/webhooks.py`), que responde 500. | Meta interpreta el 500 como fallo de entrega: reintenta el webhook y, si se repite lo suficiente, puede marcar la suscripción como no saludable o desactivarla. Antes del piloto real con Meta (o post-MVP): capturar errores del `LLMProvider` en `handle()` y responder con un mensaje de fallback / derivar a humano en vez de dejar propagar la excepción. | Abierta |
 
 ---
 
