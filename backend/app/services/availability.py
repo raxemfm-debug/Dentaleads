@@ -33,6 +33,15 @@ logger = logging.getLogger(__name__)
 _DEFAULT_SLOT_MINUTES = 30
 
 
+def get_slot_duration_minutes(clinic: Clinic) -> int:
+    """Slot granularity for *clinic*, in minutes.
+
+    Single source of truth for slot duration — reused by get_available_slots
+    below and by agendar_cita's grid validation, so neither hardcodes 30.
+    """
+    return (clinic.business_hours or {}).get("slot_duration_minutes", _DEFAULT_SLOT_MINUTES)
+
+
 def resolve_clinic_timezone(clinic: Clinic) -> ZoneInfo:
     """Resolve a clinic's IANA timezone (stdlib zoneinfo, not pytz).
 
@@ -205,7 +214,7 @@ class AvailabilityService:
         )
         rows = (await db.execute(stmt)).scalars().all()
 
-        slot_minutes = bh.get("slot_duration_minutes", _DEFAULT_SLOT_MINUTES)
+        slot_minutes = get_slot_duration_minutes(clinic)
         booked = [
             BookedSlot(
                 start=row.scheduled_at.astimezone(tz),

@@ -6,16 +6,18 @@ ToolContext   — per-request context threaded through each handler.
 ToolDispatcher — registry: tool name → async handler.  dispatch() never raises;
                  errors are contained and returned as JSON so the model can react.
 
-All 5 tools have real implementations. agendar_cita guards against double
-booking with a SAVEPOINT (db.begin_nested()) around the insert: on
-IntegrityError from uq_appointments_tenant_slot it rolls back just the
-savepoint (the outer session/transaction stays usable) and returns
-free alternatives for the same day instead of propagating the error.
+All 5 tools have real implementations. agendar_cita validates in order
+(parse → fecha_pasada → hora_fuera_de_grid → fecha_fuera_de_horizonte →
+tratamiento → insert) before guarding against double booking with a
+SAVEPOINT (db.begin_nested()) around the insert: on IntegrityError from
+uq_appointments_tenant_slot it rolls back just the savepoint (the outer
+session/transaction stays usable) and returns free alternatives for the
+same day instead of propagating the error.
 """
 import json
 import logging
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Awaitable, Callable
 
 from sqlalchemy import func, select
@@ -28,12 +30,20 @@ from app.models.clinic import Clinic
 from app.models.conversation import Conversation
 from app.models.lead import Lead
 from app.models.treatment import Treatment
-from app.services.availability import AvailabilityService, resolve_clinic_timezone
+from app.services.availability import (
+    AvailabilityService,
+    get_slot_duration_minutes,
+    resolve_clinic_timezone,
+)
 
 logger = logging.getLogger(__name__)
 
 ToolHandler = Callable[["ToolContext", dict], Awaitable[str]]
 
+# TODO(deuda): valor fijo igual para todas las clínicas; podría migrar a
+# clinic.config (p.ej. "booking_horizon_days") si algún tenant necesita un
+# horizonte de agendamiento distinto.
+MAX_BOOKING_HORIZON_DAYS = 90
 
 @dataclass
 class ToolContext:
@@ -186,11 +196,22 @@ async def _handle_derivar_a_humano(ctx: ToolContext, inputs: dict) -> str:
     return json.dumps({"status": "handoff_requested", "motivo": inputs.get("motivo", "")}, ensure_ascii=False)
 
 
-async def _handle_agendar_cita(ctx: ToolContext, inputs: dict) -> str:
+async def _handle_agendar_cita(
+    ctx: ToolContext,
+    inputs: dict,
+    *,
+    now: datetime | None = None,
+) -> str:
+    """
+    now: override for "current time" in tests (mirrors compute_slots'
+    reference_date), so the fecha_pasada/horizonte checks stay deterministic
+    instead of depending on wall-clock time. Production callers never pass it.
+    """
     fecha_hora_str: str = inputs.get("fecha_hora", "")
     tratamiento_nombre: str = inputs.get("tratamiento", "")
     nombre_paciente: str | None = inputs.get("nombre_paciente")
 
+    # --- parse -----------------------------------------------------------
     try:
         tz = resolve_clinic_timezone(ctx.clinic)
     except ValueError:
@@ -207,6 +228,26 @@ async def _handle_agendar_cita(ctx: ToolContext, inputs: dict) -> str:
     local_date_str = naive.date().isoformat()
     scheduled_at = naive.replace(tzinfo=tz) if naive.tzinfo is None else naive.astimezone(tz)
 
+    current = now if now is not None else datetime.now(tz=tz)
+
+    # --- pasada ------------------------------------------------------------
+    # Full-datetime comparison (not just the date) so "hoy a las 09:00" is
+    # rejected once it's already 14:00 today — verificar_disponibilidad's
+    # fecha_pasada only compares calendar dates, which isn't precise enough
+    # for actually booking a slot.
+    if scheduled_at < current:
+        return json.dumps({"status": "fecha_pasada"}, ensure_ascii=False)
+
+    # --- grid ----------------------------------------------------------------
+    slot_duration = get_slot_duration_minutes(ctx.clinic)
+    if scheduled_at.minute % slot_duration != 0:
+        return json.dumps({"status": "hora_fuera_de_grid"}, ensure_ascii=False)
+
+    # --- horizonte -------------------------------------------------------
+    if scheduled_at > current + timedelta(days=MAX_BOOKING_HORIZON_DAYS):
+        return json.dumps({"status": "fecha_fuera_de_horizonte"}, ensure_ascii=False)
+
+    # --- tratamiento -------------------------------------------------------
     treatment = (
         await ctx.db.execute(
             select(Treatment)
@@ -232,6 +273,7 @@ async def _handle_agendar_cita(ctx: ToolContext, inputs: dict) -> str:
         if ctx.lead.consent_at is None:
             ctx.lead.consent_at = datetime.now(tz=timezone.utc)
 
+    # --- insert --------------------------------------------------------------
     appointment = Appointment(
         tenant_id=ctx.clinic.id,
         lead_id=ctx.lead.id,

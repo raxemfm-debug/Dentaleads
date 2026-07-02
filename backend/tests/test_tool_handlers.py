@@ -15,6 +15,7 @@ import json
 import uuid
 from datetime import datetime, timezone
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
@@ -458,3 +459,67 @@ class TestAgendarCita:
         assert len(alternativas) > 0
         assert all(slot.startswith("2026-07-06T") for slot in alternativas)
         assert not any(slot.startswith("2026-07-07T") for slot in alternativas)
+
+
+# ---------------------------------------------------------------------------
+# agendar_cita — pasada / grid / horizonte validations
+#
+# All tests inject `now` explicitly (mirrors compute_slots' reference_date)
+# so they stay deterministic regardless of the wall-clock date the suite
+# happens to run on.
+# ---------------------------------------------------------------------------
+
+_LIMA = ZoneInfo("America/Lima")
+
+
+class TestAgendarCitaValidations:
+    async def test_fecha_pasada_rejects_past_datetime(self, db_session, clinic, lead, conv):
+        ctx = _ctx(db_session, clinic, conv, lead)
+        result = json.loads(
+            await _handle_agendar_cita(
+                ctx,
+                {"fecha_hora": "2026-06-30T10:00", "tratamiento": "Limpieza Dental"},
+                now=datetime(2026, 7, 1, 9, 0, tzinfo=_LIMA),
+            )
+        )
+
+        assert result["status"] == "fecha_pasada"
+
+    async def test_fecha_pasada_boundary_today_but_earlier_hour(self, db_session, clinic, lead, conv):
+        """Frontera: hoy a las 09:00 cuando 'ahora' ya son las 14:00 del mismo día."""
+        ctx = _ctx(db_session, clinic, conv, lead)
+        result = json.loads(
+            await _handle_agendar_cita(
+                ctx,
+                {"fecha_hora": "2026-07-06T09:00", "tratamiento": "Limpieza Dental"},
+                now=datetime(2026, 7, 6, 14, 0, tzinfo=_LIMA),
+            )
+        )
+
+        assert result["status"] == "fecha_pasada"
+
+    async def test_hora_fuera_de_grid_rejected(self, db_session, clinic, lead, conv):
+        # clinic fixture's business_hours={} -> default slot duration is 30 min
+        ctx = _ctx(db_session, clinic, conv, lead)
+        result = json.loads(
+            await _handle_agendar_cita(
+                ctx,
+                {"fecha_hora": "2026-07-06T10:15", "tratamiento": "Limpieza Dental"},
+                now=datetime(2026, 7, 1, 9, 0, tzinfo=_LIMA),
+            )
+        )
+
+        assert result["status"] == "hora_fuera_de_grid"
+
+    async def test_fecha_fuera_de_horizonte_rejected(self, db_session, clinic, lead, conv):
+        ctx = _ctx(db_session, clinic, conv, lead)
+        result = json.loads(
+            await _handle_agendar_cita(
+                ctx,
+                # ~106 days after "now", past MAX_BOOKING_HORIZON_DAYS=90
+                {"fecha_hora": "2026-10-15T10:00", "tratamiento": "Limpieza Dental"},
+                now=datetime(2026, 7, 1, 9, 0, tzinfo=_LIMA),
+            )
+        )
+
+        assert result["status"] == "fecha_fuera_de_horizonte"
