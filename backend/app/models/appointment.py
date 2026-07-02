@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, String
+from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -15,8 +15,29 @@ if TYPE_CHECKING:
     from app.models.treatment import Treatment
 
 
+# Estados que LIBERAN el slot. Fuente de verdad única: la usan
+# availability.py y el índice parcial uq_appointments_tenant_slot.
+SLOT_FREEING_STATUSES = ("cancelled", "no_show")
+
+_SLOT_WHERE = text(
+    "status NOT IN ({})".format(
+        ", ".join(f"'{s}'" for s in SLOT_FREEING_STATUSES)
+    )
+)
+
+
 class Appointment(UUIDMixin, TimestampMixin, Base):
     __tablename__ = "appointments"
+    __table_args__ = (
+        Index(
+            "uq_appointments_tenant_slot",
+            "tenant_id",
+            "scheduled_at",
+            unique=True,
+            postgresql_where=_SLOT_WHERE,
+            sqlite_where=_SLOT_WHERE,
+        ),
+    )
 
     tenant_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True), ForeignKey("clinics.id", ondelete="CASCADE"), nullable=False, index=True

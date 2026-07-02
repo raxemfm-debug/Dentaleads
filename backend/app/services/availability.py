@@ -25,7 +25,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
-from app.models.appointment import Appointment
+from app.models.appointment import SLOT_FREEING_STATUSES, Appointment
 from app.models.clinic import Clinic
 
 logger = logging.getLogger(__name__)
@@ -186,7 +186,7 @@ class AvailabilityService:
             select(Appointment)
             .options(selectinload(Appointment.treatment))
             .where(Appointment.tenant_id == clinic.id)
-            .where(Appointment.status.not_in(["cancelled", "no_show"]))
+            .where(Appointment.status.not_in(SLOT_FREEING_STATUSES))
             .where(Appointment.scheduled_at >= day_start)
             .where(Appointment.scheduled_at < day_end)
         )
