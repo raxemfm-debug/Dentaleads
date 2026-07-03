@@ -7,6 +7,7 @@ from app.core.providers import (
     InboundMessage,
     LLMMessage,
     LLMProvider,
+    LLMProviderError,
     LLMResponse,
     LLMTool,
     MessagingProvider,
@@ -68,6 +69,32 @@ class FakeLLMProvider(LLMProvider):
         if not categories:
             raise ValueError("classify requires at least one category")
         return categories[0]
+
+
+class FailingLLMProvider(LLMProvider):
+    """LLMProvider whose complete() always raises LLMProviderError.
+
+    Simulates an Anthropic SDK failure (timeout, connection error, rate limit, ...)
+    already translated at the provider boundary, without depending on the SDK's
+    exception types in tests that only care about conversation.handle()'s reaction.
+    """
+
+    async def complete(
+        self,
+        system_prompt: str,
+        messages: list[LLMMessage],
+        tools: list[LLMTool] | None = None,
+        max_tokens: int = 1024,
+    ) -> LLMResponse:
+        raise LLMProviderError("simulated Anthropic provider failure")
+
+    async def classify(
+        self,
+        text: str,
+        categories: list[str],
+        system_prompt: str | None = None,
+    ) -> str:
+        raise LLMProviderError("simulated Anthropic provider failure")
 
 
 class SequencedFakeLLMProvider(LLMProvider):

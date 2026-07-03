@@ -85,6 +85,15 @@ class LLMResponse:
     usage: dict              # {input_tokens, output_tokens}
 
 
+class LLMProviderError(Exception):
+    """Raised when the underlying LLM provider fails (timeout, connection, rate limit, etc.).
+
+    Implementations translate their vendor-specific SDK exceptions into this type at the
+    provider boundary, so callers (e.g. the conversation loop) can react to a provider
+    outage without depending on any single vendor's exception hierarchy.
+    """
+
+
 class LLMProvider(ABC):
     """Generate text and invoke tools via any supported large language model."""
 

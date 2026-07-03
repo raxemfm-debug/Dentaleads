@@ -16,6 +16,7 @@ from app.core.providers import (
     InboundMessage,
     LLMMessage,
     LLMProvider,
+    LLMProviderError,
     LLMResponse,
     MessagingProvider,
     OutboundMessage,
@@ -30,6 +31,10 @@ logger = logging.getLogger(__name__)
 
 HISTORY_LIMIT = 20
 MAX_TOOL_ITERATIONS = 5
+
+LLM_FALLBACK_MESSAGE = (
+    "Disculpa, tuve un problema técnico. ¿Puedes intentar de nuevo en un momento?"
+)
 
 _DEFAULT_SYSTEM = (
     "Eres el asistente virtual de {clinic_name}, una clínica dental. "
@@ -99,6 +104,33 @@ async def _get_or_create_conversation(
         db.add(conv)
         await db.flush()
     return conv
+
+
+def _persist_exchange(
+    db: AsyncSession,
+    conv: Conversation,
+    msg: InboundMessage,
+    inbound_text: str,
+    assistant_text: str,
+    assistant_metadata: dict,
+) -> None:
+    db.add(
+        Message(
+            conversation_id=conv.id,
+            role="user",
+            content=inbound_text,
+            metadata_={"message_id": msg.message_id, "message_type": msg.message_type},
+        )
+    )
+    db.add(
+        Message(
+            conversation_id=conv.id,
+            role="assistant",
+            content=assistant_text,
+            metadata_=assistant_metadata,
+        )
+    )
+    conv.last_message_at = datetime.now(timezone.utc)
 
 
 async def _run_llm_loop(
@@ -208,7 +240,29 @@ async def handle(
 
     # 7. Run the agentic tool-calling loop
     ctx = ToolContext(db=db, clinic=clinic, conv=conv, lead=lead)
-    response = await _run_llm_loop(llm, system_prompt, llm_messages, DISPATCHER, ctx)
+    try:
+        response = await _run_llm_loop(llm, system_prompt, llm_messages, DISPATCHER, ctx)
+    except LLMProviderError:
+        # The LLM provider is down (timeout, connection error, rate limit, ...). Degrade
+        # gracefully instead of letting the exception reach the webhook router: Meta
+        # interprets a 500 as delivery failure and retries the webhook, which can end up
+        # marking the subscription unhealthy. Log, persist what happened, and reply with
+        # a fallback so the patient isn't left without a response.
+        logger.error(
+            "LLM provider failed tenant=%s conv=%s from=%s",
+            clinic.id, conv.id, msg.from_number,
+            exc_info=True,
+        )
+        _persist_exchange(
+            db, conv, msg, inbound_text,
+            LLM_FALLBACK_MESSAGE,
+            {"stop_reason": "llm_provider_error"},
+        )
+        await db.flush()
+        await messaging.send_message(
+            OutboundMessage(to_number=msg.from_number, text=LLM_FALLBACK_MESSAGE)
+        )
+        return
 
     # TODO(deuda): los intercambios intermedios del loop (turnos assistant tool_use +
     # tool_results) no se persisten; solo se guarda la respuesta final de texto.
@@ -217,23 +271,11 @@ async def handle(
     # facilitar la depuración de conversaciones y la auditoría del comportamiento del bot.
 
     # 8. Persist inbound + assistant response together, then refresh conversation timestamp
-    db.add(
-        Message(
-            conversation_id=conv.id,
-            role="user",
-            content=inbound_text,
-            metadata_={"message_id": msg.message_id, "message_type": msg.message_type},
-        )
+    _persist_exchange(
+        db, conv, msg, inbound_text,
+        response.content,
+        {"stop_reason": response.stop_reason, "usage": response.usage},
     )
-    db.add(
-        Message(
-            conversation_id=conv.id,
-            role="assistant",
-            content=response.content,
-            metadata_={"stop_reason": response.stop_reason, "usage": response.usage},
-        )
-    )
-    conv.last_message_at = datetime.now(timezone.utc)
     await db.flush()
 
     # 9. Send reply

@@ -5,10 +5,16 @@ All Anthropic SDK calls are mocked — no network, no real API key required.
 """
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import anthropic
+import httpx
 import pytest
 
-from app.core.providers import LLMMessage, LLMTool
+from app.core.providers import LLMMessage, LLMProviderError, LLMTool
 from app.services.llm import ClaudeProvider, _CLASSIFY_MODEL, _COMPLETE_MODEL, get_llm_provider
+
+
+def _dummy_request() -> httpx.Request:
+    return httpx.Request("POST", "https://api.anthropic.com/v1/messages")
 
 
 # ---------------------------------------------------------------------------
@@ -261,6 +267,65 @@ class TestComplete:
         )
         call_kwargs = mock_client.messages.create.call_args.kwargs
         assert call_kwargs["max_tokens"] == 512
+
+
+# ---------------------------------------------------------------------------
+# complete() — Anthropic SDK error translation (DT-003)
+# ---------------------------------------------------------------------------
+
+class TestCompleteErrorHandling:
+    """ClaudeProvider must translate anthropic SDK errors into LLMProviderError so
+    business logic (app.services.conversation) never depends on the Anthropic SDK.
+    """
+
+    @pytest.mark.asyncio
+    async def test_api_error_translated(self, provider, mock_client):
+        mock_client.messages.create.side_effect = anthropic.APIError(
+            "boom", _dummy_request(), body=None
+        )
+        with pytest.raises(LLMProviderError):
+            await provider.complete(
+                system_prompt="S", messages=[LLMMessage(role="user", content="X")]
+            )
+
+    @pytest.mark.asyncio
+    async def test_api_timeout_error_translated(self, provider, mock_client):
+        """APITimeoutError is a subclass of APIError — must be caught too."""
+        mock_client.messages.create.side_effect = anthropic.APITimeoutError(_dummy_request())
+        with pytest.raises(LLMProviderError):
+            await provider.complete(
+                system_prompt="S", messages=[LLMMessage(role="user", content="X")]
+            )
+
+    @pytest.mark.asyncio
+    async def test_api_connection_error_translated(self, provider, mock_client):
+        """APIConnectionError is a subclass of APIError — must be caught too."""
+        mock_client.messages.create.side_effect = anthropic.APIConnectionError(
+            request=_dummy_request()
+        )
+        with pytest.raises(LLMProviderError):
+            await provider.complete(
+                system_prompt="S", messages=[LLMMessage(role="user", content="X")]
+            )
+
+    @pytest.mark.asyncio
+    async def test_original_exception_preserved_as_cause(self, provider, mock_client):
+        original = anthropic.APITimeoutError(_dummy_request())
+        mock_client.messages.create.side_effect = original
+        with pytest.raises(LLMProviderError) as exc_info:
+            await provider.complete(
+                system_prompt="S", messages=[LLMMessage(role="user", content="X")]
+            )
+        assert exc_info.value.__cause__ is original
+
+    @pytest.mark.asyncio
+    async def test_non_api_error_not_translated(self, provider, mock_client):
+        """Bugs unrelated to the Anthropic API (e.g. a local ValueError) must propagate as-is."""
+        mock_client.messages.create.side_effect = ValueError("unrelated bug")
+        with pytest.raises(ValueError):
+            await provider.complete(
+                system_prompt="S", messages=[LLMMessage(role="user", content="X")]
+            )
 
 
 # ---------------------------------------------------------------------------

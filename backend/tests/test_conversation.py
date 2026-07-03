@@ -11,8 +11,8 @@ from app.models.clinic import Clinic
 from app.models.conversation import Conversation
 from app.models.lead import Lead
 from app.models.message import Message
-from app.services.conversation import HISTORY_LIMIT, handle
-from tests.fakes import FakeLLMProvider, FakeMessagingProvider, SpyFakeLLMProvider
+from app.services.conversation import HISTORY_LIMIT, LLM_FALLBACK_MESSAGE, handle
+from tests.fakes import FailingLLMProvider, FakeLLMProvider, FakeMessagingProvider, SpyFakeLLMProvider
 
 
 # ---------------------------------------------------------------------------
@@ -194,6 +194,63 @@ async def test_history_sent_to_llm_in_chronological_order(db_session, clinic):
     tracked = {"primera pregunta", "primera respuesta", "segunda pregunta"}
     ordered = [m.content for m in spy.calls[0] if m.content in tracked]
     assert ordered == ["primera pregunta", "primera respuesta", "segunda pregunta"]
+
+
+# ---------------------------------------------------------------------------
+# LLM provider failure (DT-003)
+# ---------------------------------------------------------------------------
+
+async def test_llm_provider_error_does_not_propagate(db_session, clinic):
+    """handle() must swallow LLMProviderError, not let it reach the webhook router."""
+    await handle(_msg(), db_session, FakeMessagingProvider(), FailingLLMProvider())
+
+
+async def test_llm_provider_error_sends_fallback_to_sender(db_session, clinic):
+    messaging = FakeMessagingProvider()
+    await handle(_msg(from_number="5491188887777"), db_session, messaging, FailingLLMProvider())
+
+    assert len(messaging.sent) == 1
+    assert messaging.sent[0].to_number == "5491188887777"
+    assert messaging.sent[0].text == LLM_FALLBACK_MESSAGE
+
+
+async def test_llm_provider_error_persists_inbound_and_fallback(db_session, clinic):
+    messaging = FakeMessagingProvider()
+    await handle(_msg(text="Hola"), db_session, messaging, FailingLLMProvider())
+
+    conv = (await db_session.execute(
+        select(Conversation).where(Conversation.tenant_id == clinic.id)
+    )).scalars().first()
+    msgs = (await db_session.execute(
+        select(Message)
+        .where(Message.conversation_id == conv.id)
+        .order_by(Message.created_at.asc())
+    )).scalars().all()
+
+    assert len(msgs) == 2
+    assert msgs[0].role == "user"
+    assert msgs[0].content == "Hola"
+    assert msgs[1].role == "assistant"
+    assert msgs[1].content == LLM_FALLBACK_MESSAGE
+    assert msgs[1].metadata_ == {"stop_reason": "llm_provider_error"}
+
+
+async def test_normal_flow_intact_when_llm_succeeds(db_session, clinic):
+    """Regression check: a healthy LLMProvider is unaffected by the new error handling."""
+    messaging = FakeMessagingProvider()
+    await handle(_msg(from_number="5491199990000"), db_session, messaging, FakeLLMProvider())
+
+    assert messaging.sent[0].text == FakeLLMProvider.FIXED_RESPONSE
+    conv = (await db_session.execute(
+        select(Conversation).where(Conversation.tenant_id == clinic.id)
+    )).scalars().first()
+    msgs = (await db_session.execute(
+        select(Message)
+        .where(Message.conversation_id == conv.id)
+        .order_by(Message.created_at.asc())
+    )).scalars().all()
+    assert len(msgs) == 2
+    assert msgs[1].content == FakeLLMProvider.FIXED_RESPONSE
 
 
 async def test_history_limited_to_history_limit(db_session, clinic):

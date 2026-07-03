@@ -4,10 +4,10 @@ LLM service layer — ClaudeProvider wraps the Anthropic SDK behind LLMProvider.
 The provider interface keeps business logic decoupled from the SDK so the
 model or vendor can be swapped by changing this file alone.
 """
-from anthropic import AsyncAnthropic
+from anthropic import APIError, AsyncAnthropic
 
 from app.config import settings
-from app.core.providers import LLMMessage, LLMProvider, LLMResponse, LLMTool
+from app.core.providers import LLMMessage, LLMProvider, LLMProviderError, LLMResponse, LLMTool
 
 _COMPLETE_MODEL = "claude-sonnet-4-6"
 _CLASSIFY_MODEL = "claude-haiku-4-5-20251001"
@@ -75,7 +75,13 @@ class ClaudeProvider(LLMProvider):
         if tools:
             kwargs["tools"] = _to_anthropic_tools(tools)
 
-        response = await self._client.messages.create(**kwargs)
+        try:
+            response = await self._client.messages.create(**kwargs)
+        except APIError as exc:
+            # Covers the whole Anthropic SDK error hierarchy (APITimeoutError,
+            # APIConnectionError, APIStatusError and its subclasses like
+            # RateLimitError/AuthenticationError all inherit from APIError).
+            raise LLMProviderError(f"Anthropic API error: {exc}") from exc
 
         content_text = ""
         tool_calls: list[dict] = []
