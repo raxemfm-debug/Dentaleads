@@ -14,7 +14,12 @@ from typing import Any
 
 import httpx
 
-from app.core.providers import InboundMessage, MessagingProvider, OutboundMessage
+from app.core.providers import (
+    InboundMessage,
+    MessagingProvider,
+    MessagingProviderError,
+    OutboundMessage,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,12 +67,18 @@ class WhatsAppProvider(MessagingProvider):
     async def _post_message(self, payload: dict[str, Any]) -> str:
         self._require_send_credentials()
         client = await self._get_client()
-        response = await client.post(
-            self._send_url(),
-            json=payload,
-            headers=self._auth_headers(),
-        )
-        response.raise_for_status()
+        try:
+            response = await client.post(
+                self._send_url(),
+                json=payload,
+                headers=self._auth_headers(),
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            # Covers both transport failures (timeout, connection refused — httpx.RequestError)
+            # and non-2xx responses (httpx.HTTPStatusError from raise_for_status, e.g. an
+            # expired access token returning 401). Both inherit from httpx.HTTPError.
+            raise MessagingProviderError(f"WhatsApp Cloud API error: {exc}") from exc
         data = response.json()
         return data["messages"][0]["id"]
 

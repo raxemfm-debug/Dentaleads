@@ -19,6 +19,7 @@ from app.core.providers import (
     LLMProviderError,
     LLMResponse,
     MessagingProvider,
+    MessagingProviderError,
     OutboundMessage,
 )
 from app.models.clinic import Clinic
@@ -131,6 +132,20 @@ def _persist_exchange(
         )
     )
     conv.last_message_at = datetime.now(timezone.utc)
+
+
+async def _send_reply(messaging: MessagingProvider, to_number: str, text: str) -> None:
+    """Send the reply, swallowing MessagingProviderError (DT-004).
+
+    A delivery failure (expired token, timeout, ...) must never propagate to the
+    webhook router: Meta interprets a 500 as delivery failure and retries the
+    webhook, which can end up marking the subscription unhealthy. The exchange is
+    already persisted by this point, so we log and move on rather than raise.
+    """
+    try:
+        await messaging.send_message(OutboundMessage(to_number=to_number, text=text))
+    except MessagingProviderError:
+        logger.error("messaging provider failed to=%s", to_number, exc_info=True)
 
 
 async def _run_llm_loop(
@@ -259,9 +274,7 @@ async def handle(
             {"stop_reason": "llm_provider_error"},
         )
         await db.flush()
-        await messaging.send_message(
-            OutboundMessage(to_number=msg.from_number, text=LLM_FALLBACK_MESSAGE)
-        )
+        await _send_reply(messaging, msg.from_number, LLM_FALLBACK_MESSAGE)
         return
 
     # TODO(deuda): los intercambios intermedios del loop (turnos assistant tool_use +
@@ -280,6 +293,4 @@ async def handle(
 
     # 9. Send reply
     logger.info("reply tenant=%s conv=%s to=%s", clinic.id, conv.id, msg.from_number)
-    await messaging.send_message(
-        OutboundMessage(to_number=msg.from_number, text=response.content)
-    )
+    await _send_reply(messaging, msg.from_number, response.content)

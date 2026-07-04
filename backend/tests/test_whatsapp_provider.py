@@ -9,9 +9,10 @@ import hmac as _hmac
 import json
 from unittest.mock import AsyncMock, MagicMock
 
+import httpx
 import pytest
 
-from app.core.providers import OutboundMessage
+from app.core.providers import MessagingProviderError, OutboundMessage
 from app.services.whatsapp import WhatsAppProvider
 
 # ------------------------------------------------------------------
@@ -356,6 +357,78 @@ async def test_send_template_posts_correct_payload():
     params_sent = template["components"][0]["parameters"]
     assert params_sent[0] == {"type": "text", "text": "María"}
     assert params_sent[1] == {"type": "text", "text": "mañana a las 10:00"}
+
+
+# ------------------------------------------------------------------
+# send error translation (DT-004)
+# ------------------------------------------------------------------
+#
+# _post_message backs both send_message and send_template, so a failure at that
+# layer (expired token, timeout, ...) must surface as MessagingProviderError —
+# never a raw httpx exception — so app.services.conversation never depends on httpx.
+
+
+def _dummy_request() -> httpx.Request:
+    return httpx.Request("POST", "https://graph.facebook.com/fake")
+
+
+async def test_send_message_translates_http_status_error():
+    """A non-2xx response (e.g. 401 from an expired access token) must translate."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "401 Unauthorized", request=_dummy_request(), response=MagicMock(status_code=401)
+    )
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(return_value=mock_response)
+    provider = _make_provider(httpx_client=mock_client)
+
+    with pytest.raises(MessagingProviderError):
+        await provider.send_message(OutboundMessage(to_number="+111", text="test"))
+
+
+async def test_send_message_translates_connection_error():
+    """A transport-level failure (timeout, connection refused) must also translate."""
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(side_effect=httpx.ConnectError("connection refused"))
+    provider = _make_provider(httpx_client=mock_client)
+
+    with pytest.raises(MessagingProviderError):
+        await provider.send_message(OutboundMessage(to_number="+111", text="test"))
+
+
+async def test_send_message_original_exception_preserved_as_cause():
+    original = httpx.ConnectError("connection refused")
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(side_effect=original)
+    provider = _make_provider(httpx_client=mock_client)
+
+    with pytest.raises(MessagingProviderError) as exc_info:
+        await provider.send_message(OutboundMessage(to_number="+111", text="test"))
+    assert exc_info.value.__cause__ is original
+
+
+async def test_send_template_translates_http_status_error():
+    """send_template shares _post_message with send_message, so it must translate too."""
+    mock_response = MagicMock()
+    mock_response.raise_for_status.side_effect = httpx.HTTPStatusError(
+        "401 Unauthorized", request=_dummy_request(), response=MagicMock(status_code=401)
+    )
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(return_value=mock_response)
+    provider = _make_provider(httpx_client=mock_client)
+
+    with pytest.raises(MessagingProviderError):
+        await provider.send_template(to_number="+111", template_name="recordatorio_cita", params=[])
+
+
+async def test_send_message_non_http_error_not_translated():
+    """Bugs unrelated to the HTTP call (e.g. a local bug) must propagate as-is."""
+    mock_client = MagicMock()
+    mock_client.post = AsyncMock(side_effect=ValueError("unrelated bug"))
+    provider = _make_provider(httpx_client=mock_client)
+
+    with pytest.raises(ValueError):
+        await provider.send_message(OutboundMessage(to_number="+111", text="test"))
 
 
 async def test_send_template_empty_params():

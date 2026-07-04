@@ -12,7 +12,13 @@ from app.models.conversation import Conversation
 from app.models.lead import Lead
 from app.models.message import Message
 from app.services.conversation import HISTORY_LIMIT, LLM_FALLBACK_MESSAGE, handle
-from tests.fakes import FailingLLMProvider, FakeLLMProvider, FakeMessagingProvider, SpyFakeLLMProvider
+from tests.fakes import (
+    FailingLLMProvider,
+    FailingMessagingProvider,
+    FakeLLMProvider,
+    FakeMessagingProvider,
+    SpyFakeLLMProvider,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -251,6 +257,56 @@ async def test_normal_flow_intact_when_llm_succeeds(db_session, clinic):
     )).scalars().all()
     assert len(msgs) == 2
     assert msgs[1].content == FakeLLMProvider.FIXED_RESPONSE
+
+
+# ---------------------------------------------------------------------------
+# Messaging provider failure (DT-004)
+# ---------------------------------------------------------------------------
+
+async def test_messaging_provider_error_does_not_propagate(db_session, clinic):
+    """handle() must swallow MessagingProviderError, not let it reach the webhook router."""
+    await handle(_msg(), db_session, FailingMessagingProvider(), FakeLLMProvider())
+
+
+async def test_messaging_provider_error_still_persists_exchange(db_session, clinic):
+    """A send failure must not stop the user+assistant pair from being persisted —
+    the reply was generated fine, only delivery failed."""
+    await handle(_msg(text="Hola"), db_session, FailingMessagingProvider(), FakeLLMProvider())
+
+    conv = (await db_session.execute(
+        select(Conversation).where(Conversation.tenant_id == clinic.id)
+    )).scalars().first()
+    msgs = (await db_session.execute(
+        select(Message)
+        .where(Message.conversation_id == conv.id)
+        .order_by(Message.created_at.asc())
+    )).scalars().all()
+
+    assert len(msgs) == 2
+    assert msgs[0].role == "user"
+    assert msgs[1].role == "assistant"
+    assert msgs[1].content == FakeLLMProvider.FIXED_RESPONSE
+
+
+async def test_messaging_provider_error_in_fallback_path_does_not_propagate(db_session, clinic):
+    """Both the LLM and the send fail: handle() must still swallow both, not raise."""
+    await handle(_msg(), db_session, FailingMessagingProvider(), FailingLLMProvider())
+
+
+async def test_messaging_provider_error_in_fallback_path_persists_fallback(db_session, clinic):
+    await handle(_msg(text="Hola"), db_session, FailingMessagingProvider(), FailingLLMProvider())
+
+    conv = (await db_session.execute(
+        select(Conversation).where(Conversation.tenant_id == clinic.id)
+    )).scalars().first()
+    msgs = (await db_session.execute(
+        select(Message)
+        .where(Message.conversation_id == conv.id)
+        .order_by(Message.created_at.asc())
+    )).scalars().all()
+
+    assert len(msgs) == 2
+    assert msgs[1].content == LLM_FALLBACK_MESSAGE
 
 
 async def test_history_limited_to_history_limit(db_session, clinic):

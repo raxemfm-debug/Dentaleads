@@ -11,6 +11,7 @@ from app.core.providers import (
     LLMResponse,
     LLMTool,
     MessagingProvider,
+    MessagingProviderError,
     OutboundMessage,
 )
 
@@ -27,6 +28,27 @@ class FakeMessagingProvider(MessagingProvider):
 
     async def send_template(self, to_number: str, template_name: str, params: list[str]) -> str:
         return "fake-wamid-template"
+
+    def parse_inbound(self, raw_payload: dict) -> list[InboundMessage]:
+        return []
+
+    def verify_signature(self, body: bytes, signature_header: str) -> bool:
+        return True
+
+
+class FailingMessagingProvider(MessagingProvider):
+    """MessagingProvider whose send_message/send_template always raise MessagingProviderError.
+
+    Simulates a WhatsApp Cloud API failure (expired access token, timeout, ...) already
+    translated at the provider boundary, without depending on httpx in tests that only
+    care about conversation.handle()'s reaction (DT-004).
+    """
+
+    async def send_message(self, message: OutboundMessage) -> str:
+        raise MessagingProviderError("simulated WhatsApp provider failure")
+
+    async def send_template(self, to_number: str, template_name: str, params: list[str]) -> str:
+        raise MessagingProviderError("simulated WhatsApp provider failure")
 
     def parse_inbound(self, raw_payload: dict) -> list[InboundMessage]:
         return []

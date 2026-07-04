@@ -33,6 +33,15 @@ class OutboundMessage:
     interactive: dict | None = None
 
 
+class MessagingProviderError(Exception):
+    """Raised when the underlying messaging provider fails (HTTP error, timeout, auth, etc.).
+
+    Implementations translate their vendor-specific exceptions (e.g. httpx errors) into
+    this type at the provider boundary, so callers (e.g. the conversation loop) can react
+    to a delivery failure without depending on any single vendor's exception hierarchy.
+    """
+
+
 class MessagingProvider(ABC):
     """Send and receive messages over any supported channel."""
 
