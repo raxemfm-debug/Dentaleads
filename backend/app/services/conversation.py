@@ -53,6 +53,22 @@ def _build_system_prompt(clinic: Clinic) -> str:
     return template.format(clinic_name=clinic_name, extra=extra + " " if extra else "")
 
 
+async def is_wamid_processed(db: AsyncSession, wamid: str) -> bool:
+    """True if a message with this WhatsApp message id (wamid) was already persisted.
+
+    Meta retries webhook deliveries it considers failed (e.g. while send_message keeps
+    failing due to an expired token, DT-004). Without this guard, every retry would
+    re-run the LLM and persist a duplicate user+assistant pair for the same inbound
+    message. Callers must check this before invoking handle().
+    """
+    if not wamid:
+        return False
+    existing = (
+        await db.execute(select(Message.id).where(Message.wamid == wamid))
+    ).scalars().first()
+    return existing is not None
+
+
 async def _get_or_create_lead(
     db: AsyncSession,
     tenant_id,
@@ -120,6 +136,7 @@ def _persist_exchange(
             conversation_id=conv.id,
             role="user",
             content=inbound_text,
+            wamid=msg.message_id or None,
             metadata_={"message_id": msg.message_id, "message_type": msg.message_type},
         )
     )

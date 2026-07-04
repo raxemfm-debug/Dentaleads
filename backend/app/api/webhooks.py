@@ -15,7 +15,7 @@ from app.config import settings
 from app.core.database import get_db
 from app.core.exceptions import TenantNotFoundError
 from app.core.providers import LLMProvider
-from app.services.conversation import handle
+from app.services.conversation import handle, is_wamid_processed
 from app.services.llm import get_llm_provider
 from app.services.whatsapp import WhatsAppProvider
 
@@ -73,6 +73,10 @@ async def whatsapp_inbound(
             msg.message_type,
             msg.message_id,
         )
+        if await is_wamid_processed(db, msg.message_id):
+            logger.info("duplicate wamid=%s — already processed, skipping", msg.message_id)
+            continue
+
         send_provider = WhatsAppProvider(
             app_secret=settings.whatsapp_app_secret,
             phone_number_id=msg.tenant_phone_id,

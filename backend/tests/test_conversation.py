@@ -11,7 +11,7 @@ from app.models.clinic import Clinic
 from app.models.conversation import Conversation
 from app.models.lead import Lead
 from app.models.message import Message
-from app.services.conversation import HISTORY_LIMIT, LLM_FALLBACK_MESSAGE, handle
+from app.services.conversation import HISTORY_LIMIT, LLM_FALLBACK_MESSAGE, handle, is_wamid_processed
 from tests.fakes import (
     FailingLLMProvider,
     FailingMessagingProvider,
@@ -85,8 +85,8 @@ async def test_creates_lead_on_first_message(db_session, clinic):
 
 
 async def test_reuses_existing_lead(db_session, clinic):
-    await handle(_msg(), db_session, FakeMessagingProvider(), FakeLLMProvider())
-    await handle(_msg(), db_session, FakeMessagingProvider(), FakeLLMProvider())
+    await handle(_msg(msg_id="wamid-001"), db_session, FakeMessagingProvider(), FakeLLMProvider())
+    await handle(_msg(msg_id="wamid-002"), db_session, FakeMessagingProvider(), FakeLLMProvider())
 
     leads = (await db_session.execute(
         select(Lead).where(Lead.tenant_id == clinic.id)
@@ -111,8 +111,8 @@ async def test_creates_conversation_on_first_message(db_session, clinic):
 
 
 async def test_reuses_active_conversation(db_session, clinic):
-    await handle(_msg(), db_session, FakeMessagingProvider(), FakeLLMProvider())
-    await handle(_msg(), db_session, FakeMessagingProvider(), FakeLLMProvider())
+    await handle(_msg(msg_id="wamid-001"), db_session, FakeMessagingProvider(), FakeLLMProvider())
+    await handle(_msg(msg_id="wamid-002"), db_session, FakeMessagingProvider(), FakeLLMProvider())
 
     convs = (await db_session.execute(
         select(Conversation).where(Conversation.tenant_id == clinic.id)
@@ -180,7 +180,7 @@ async def test_history_sent_to_llm_in_chronological_order(db_session, clinic):
     messaging = FakeMessagingProvider()
 
     # Bootstrap to create lead + conversation, then seed history with explicit timestamps.
-    await handle(_msg(text="bootstrap"), db_session, messaging, FakeLLMProvider())
+    await handle(_msg(text="bootstrap", msg_id="wamid-bootstrap"), db_session, messaging, FakeLLMProvider())
     conv = (await db_session.execute(
         select(Conversation).where(Conversation.tenant_id == clinic.id)
     )).scalars().first()
@@ -193,7 +193,7 @@ async def test_history_sent_to_llm_in_chronological_order(db_session, clinic):
                            metadata_={}, created_at=t2, updated_at=t2))
     await db_session.flush()
 
-    await handle(_msg(text="segunda pregunta"), db_session, messaging, spy)
+    await handle(_msg(text="segunda pregunta", msg_id="wamid-segunda"), db_session, messaging, spy)
 
     # Filter to only the seeded messages + new inbound, ignoring the bootstrap pair
     # whose same-flush timestamps have undefined relative order.
@@ -309,13 +309,43 @@ async def test_messaging_provider_error_in_fallback_path_persists_fallback(db_se
     assert msgs[1].content == LLM_FALLBACK_MESSAGE
 
 
+# ---------------------------------------------------------------------------
+# Idempotency by wamid (DT-004)
+# ---------------------------------------------------------------------------
+
+async def test_is_wamid_processed_false_when_unseen(db_session, clinic):
+    assert await is_wamid_processed(db_session, "wamid-unseen") is False
+
+
+async def test_is_wamid_processed_false_for_empty_string(db_session, clinic):
+    assert await is_wamid_processed(db_session, "") is False
+
+
+async def test_is_wamid_processed_true_after_handle(db_session, clinic):
+    await handle(_msg(msg_id="wamid-seen"), db_session, FakeMessagingProvider(), FakeLLMProvider())
+    assert await is_wamid_processed(db_session, "wamid-seen") is True
+
+
+async def test_persisted_user_message_stores_wamid(db_session, clinic):
+    await handle(_msg(msg_id="wamid-store-test"), db_session, FakeMessagingProvider(), FakeLLMProvider())
+
+    conv = (await db_session.execute(
+        select(Conversation).where(Conversation.tenant_id == clinic.id)
+    )).scalars().first()
+    user_msg = (await db_session.execute(
+        select(Message).where(Message.conversation_id == conv.id, Message.role == "user")
+    )).scalars().first()
+
+    assert user_msg.wamid == "wamid-store-test"
+
+
 async def test_history_limited_to_history_limit(db_session, clinic):
     """The LLM receives at most HISTORY_LIMIT historical rows, plus the new inbound."""
     spy = SpyFakeLLMProvider()
     messaging = FakeMessagingProvider()
 
     # Bootstrap lead + conversation via a normal call
-    await handle(_msg(text="bootstrap"), db_session, messaging, FakeLLMProvider())
+    await handle(_msg(text="bootstrap", msg_id="wamid-bootstrap"), db_session, messaging, FakeLLMProvider())
     conv = (await db_session.execute(
         select(Conversation).where(Conversation.tenant_id == clinic.id)
     )).scalars().first()
@@ -334,7 +364,7 @@ async def test_history_limited_to_history_limit(db_session, clinic):
         ))
     await db_session.flush()
 
-    await handle(_msg(text="nuevo"), db_session, messaging, spy)
+    await handle(_msg(text="nuevo", msg_id="wamid-nuevo"), db_session, messaging, spy)
 
     # HISTORY_LIMIT historical rows fetched + 1 inbound appended
     assert len(spy.calls[0]) == HISTORY_LIMIT + 1

@@ -159,3 +159,30 @@ async def test_send_failure_returns_200_and_does_not_duplicate_messages(
 
     msgs = (await db_session.execute(select(Message))).scalars().all()
     assert len(msgs) == 2
+
+
+# ---------------------------------------------------------------------------
+# Idempotency by wamid (DT-004, piece 2)
+# ---------------------------------------------------------------------------
+
+async def test_duplicate_wamid_processed_once(
+    client, db_session, mock_whatsapp_send, fake_llm_provider
+):
+    """The same wamid delivered twice (a Meta retry) must be processed only once:
+    a single message pair persisted, a single reply sent."""
+    clinic = Clinic(name="Clínica Dup Test", whatsapp_phone_id=_PHONE_NUMBER_ID, config={})
+    db_session.add(clinic)
+    await db_session.flush()
+
+    body = json.dumps(_text_payload("Hola, ¿tienen turno mañana?", from_number="15551234000")).encode()
+    headers = {"X-Hub-Signature-256": _sign(body), "Content-Type": "application/json"}
+
+    first = await client.post("/webhook/whatsapp", content=body, headers=headers)
+    second = await client.post("/webhook/whatsapp", content=body, headers=headers)
+
+    assert first.status_code == 200
+    assert second.status_code == 200
+    assert mock_whatsapp_send.post.await_count == 1
+
+    msgs = (await db_session.execute(select(Message))).scalars().all()
+    assert len(msgs) == 2
