@@ -26,6 +26,7 @@ from app.models.clinic import Clinic
 from app.models.conversation import Conversation
 from app.models.lead import Lead
 from app.models.message import Message
+from app.services.availability import resolve_clinic_timezone
 from app.services.tools import DENTAL_TOOLS, DISPATCHER, ToolContext, ToolDispatcher
 
 logger = logging.getLogger(__name__)
@@ -44,13 +45,50 @@ _DEFAULT_SYSTEM = (
     "Nunca emitas diagnósticos ni reemplaces la valoración del profesional."
 )
 
+_DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+_MESES_ES = [
+    "enero", "febrero", "marzo", "abril", "mayo", "junio",
+    "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
+]
 
-def _build_system_prompt(clinic: Clinic) -> str:
+
+def _format_fecha_actual(now: datetime, tz_name: str) -> str:
+    dia = _DIAS_ES[now.weekday()]
+    mes = _MESES_ES[now.month - 1]
+    return (
+        f"Hoy es {dia} {now.day} de {mes} de {now.year}, {now:%H:%M} ({tz_name}). "
+        'Interpreta toda fecha relativa ("el viernes", "mañana") respecto a HOY '
+        "y nunca propongas fechas pasadas."
+    )
+
+
+def _build_system_prompt(clinic: Clinic, *, now: datetime | None = None) -> str:
+    """Compose the clinic's system prompt, prefixed with the current date/time.
+
+    now: override for "current time" in tests (mirrors _handle_agendar_cita's
+    pattern in tools.py), so the injected date stays deterministic instead of
+    depending on wall-clock time. Production callers never pass it. DT-005: without
+    this, the model has no notion of "today" and hallucinates dates when resolving
+    relative expressions like "el viernes".
+    """
     cfg = clinic.config or {}
     clinic_name = cfg.get("clinic_name") or clinic.name
     extra = cfg.get("description", "").strip()
     template = cfg.get("system_prompt_template") or _DEFAULT_SYSTEM
-    return template.format(clinic_name=clinic_name, extra=extra + " " if extra else "")
+    base = template.format(clinic_name=clinic_name, extra=extra + " " if extra else "")
+
+    try:
+        tz = resolve_clinic_timezone(clinic)
+    except ValueError:
+        logger.error(
+            "clinic %s has invalid timezone '%s', falling back to UTC for system prompt date",
+            clinic.id, clinic.timezone,
+        )
+        tz = timezone.utc
+
+    current = now if now is not None else datetime.now(tz=tz)
+    fecha_actual = _format_fecha_actual(current, clinic.timezone or "UTC")
+    return f"{fecha_actual}\n\n{base}"
 
 
 async def is_wamid_processed(db: AsyncSession, wamid: str) -> bool:

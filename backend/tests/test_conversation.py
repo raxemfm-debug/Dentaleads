@@ -1,5 +1,6 @@
 """Tests for conversation.handle()."""
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import pytest
 import pytest_asyncio
@@ -11,7 +12,13 @@ from app.models.clinic import Clinic
 from app.models.conversation import Conversation
 from app.models.lead import Lead
 from app.models.message import Message
-from app.services.conversation import HISTORY_LIMIT, LLM_FALLBACK_MESSAGE, handle, is_wamid_processed
+from app.services.conversation import (
+    HISTORY_LIMIT,
+    LLM_FALLBACK_MESSAGE,
+    _build_system_prompt,
+    handle,
+    is_wamid_processed,
+)
 from tests.fakes import (
     FailingLLMProvider,
     FailingMessagingProvider,
@@ -369,3 +376,55 @@ async def test_history_limited_to_history_limit(db_session, clinic):
     # HISTORY_LIMIT historical rows fetched + 1 inbound appended
     assert len(spy.calls[0]) == HISTORY_LIMIT + 1
     assert spy.calls[0][-1].content == "nuevo"
+
+
+# ---------------------------------------------------------------------------
+# System prompt — fecha actual inyectada (DT-005)
+#
+# _build_system_prompt is a pure function of (clinic, now), so these tests
+# construct Clinic objects directly rather than going through db_session —
+# no persistence needed to exercise the date-formatting logic.
+# ---------------------------------------------------------------------------
+
+def test_system_prompt_contains_frozen_current_date():
+    clinic = Clinic(
+        name="Clínica Test",
+        whatsapp_phone_id="phone-fecha",
+        timezone="America/Lima",
+        config={},
+    )
+    frozen_now = datetime(2026, 7, 5, 9, 53, tzinfo=ZoneInfo("America/Lima"))
+
+    prompt = _build_system_prompt(clinic, now=frozen_now)
+
+    assert "Hoy es domingo 5 de julio de 2026, 09:53 (America/Lima)." in prompt
+    assert 'nunca propongas fechas pasadas' in prompt
+
+
+def test_system_prompt_date_changes_by_tenant_timezone():
+    """Same instant, different clinic timezone -> different calendar date/time in the prompt."""
+    clinic = Clinic(
+        name="Clínica Madrid",
+        whatsapp_phone_id="phone-madrid",
+        timezone="Europe/Madrid",
+        config={},
+    )
+    frozen_now = datetime(2026, 7, 5, 15, 30, tzinfo=ZoneInfo("Europe/Madrid"))
+
+    prompt = _build_system_prompt(clinic, now=frozen_now)
+
+    assert "Hoy es domingo 5 de julio de 2026, 15:30 (Europe/Madrid)." in prompt
+
+
+def test_system_prompt_falls_back_to_utc_on_invalid_timezone():
+    clinic = Clinic(
+        name="Clínica Rota",
+        whatsapp_phone_id="phone-rota",
+        timezone="Nowhere/Fake",
+        config={},
+    )
+    frozen_now = datetime(2026, 7, 5, 12, 0, tzinfo=timezone.utc)
+
+    prompt = _build_system_prompt(clinic, now=frozen_now)
+
+    assert "Hoy es domingo 5 de julio de 2026, 12:00 (Nowhere/Fake)." in prompt
