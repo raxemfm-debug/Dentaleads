@@ -116,7 +116,11 @@ DENTAL_TOOLS: list[LLMTool] = [
     ),
     LLMTool(
         name="derivar_a_humano",
-        description="Transfiere la conversación a un operador humano de la clínica.",
+        description=(
+            "Marca la conversación para que el/la doctor(a) o el personal del "
+            "consultorio la revise y confirme por este mismo chat lo que el bot "
+            "no pudo resolver."
+        ),
         input_schema={
             "type": "object",
             "properties": {
