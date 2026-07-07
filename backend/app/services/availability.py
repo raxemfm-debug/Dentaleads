@@ -167,6 +167,8 @@ class AvailabilityService:
         db: AsyncSession,
         clinic: Clinic,
         date_str: str,
+        *,
+        today: date | None = None,
     ) -> dict:
         """
         Returns available slots for *clinic* on *date_str* ("YYYY-MM-DD").
@@ -174,6 +176,11 @@ class AvailabilityService:
         Early-outs (invalid date, past date, closed day) skip the DB query.
         For open days, fetches non-cancelled/no-show appointments and their
         treatment durations, then delegates to compute_slots.
+
+        today: override for "today" in tests (mirrors compute_slots' own
+        reference_date and _handle_agendar_cita's `now`), so the fecha_pasada
+        check and the slots returned stay deterministic instead of depending
+        on wall-clock time. Production callers never pass it.
         """
         bh: dict = clinic.business_hours or {}
         tz_str: str = clinic.timezone or "UTC"
@@ -189,7 +196,7 @@ class AvailabilityService:
         except ValueError:
             return {"disponible": False, "motivo": "fecha_invalida"}
 
-        today = datetime.now(tz=tz).date()
+        today = today if today is not None else datetime.now(tz=tz).date()
         if requested_date < today:
             return {"disponible": False, "motivo": "fecha_pasada"}
 

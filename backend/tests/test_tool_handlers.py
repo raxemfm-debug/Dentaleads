@@ -311,6 +311,8 @@ class TestDerivarAHumano:
 # agendar_cita
 # ---------------------------------------------------------------------------
 
+_LIMA = ZoneInfo("America/Lima")
+
 # Monday with a morning + evening range, matching test_availability.py's
 # BH_STANDARD shape. 2026-07-06 is a Monday.
 _BH_LIMA = {
@@ -327,6 +329,15 @@ _BH_LIMA = {
 }
 
 
+@pytest.fixture
+def now_lima() -> datetime:
+    """Frozen "now" (before every hardcoded 2026-07-06 fecha_hora below) for
+    agendar_cita's `now` override, so these tests stay deterministic instead
+    of failing once the real wall-clock date passes 2026-07-06.
+    """
+    return datetime(2026, 7, 1, 9, 0, tzinfo=_LIMA)
+
+
 @pytest_asyncio.fixture
 async def lead2(db_session, clinic):
     l = Lead(tenant_id=clinic.id, whatsapp_number="+51999000002", source="whatsapp", status="new")
@@ -337,11 +348,15 @@ async def lead2(db_session, clinic):
 
 
 class TestAgendarCita:
-    async def test_schedules_appointment_and_persists_row(self, db_session, clinic, lead, conv, treatment):
+    async def test_schedules_appointment_and_persists_row(
+        self, db_session, clinic, lead, conv, treatment, now_lima
+    ):
         ctx = _ctx(db_session, clinic, conv, lead)
         result = json.loads(
             await _handle_agendar_cita(
-                ctx, {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Limpieza Dental"}
+                ctx,
+                {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Limpieza Dental"},
+                now=now_lima,
             )
         )
 
@@ -354,7 +369,9 @@ class TestAgendarCita:
         assert row.treatment_id == treatment.id
         assert row.status == "confirmed"
 
-    async def test_sets_patient_name_and_consent(self, db_session, clinic, lead, conv, treatment):
+    async def test_sets_patient_name_and_consent(
+        self, db_session, clinic, lead, conv, treatment, now_lima
+    ):
         assert lead.consent_at is None
         ctx = _ctx(db_session, clinic, conv, lead)
         await _handle_agendar_cita(
@@ -364,17 +381,22 @@ class TestAgendarCita:
                 "tratamiento": "Limpieza Dental",
                 "nombre_paciente": "Ana García",
             },
+            now=now_lima,
         )
 
         await db_session.refresh(lead)
         assert lead.name == "Ana García"
         assert lead.consent_at is not None
 
-    async def test_unknown_treatment_schedules_with_none_and_aviso(self, db_session, clinic, lead, conv):
+    async def test_unknown_treatment_schedules_with_none_and_aviso(
+        self, db_session, clinic, lead, conv, now_lima
+    ):
         ctx = _ctx(db_session, clinic, conv, lead)
         result = json.loads(
             await _handle_agendar_cita(
-                ctx, {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Cirugía Marciana"}
+                ctx,
+                {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Cirugía Marciana"},
+                now=now_lima,
             )
         )
 
@@ -396,12 +418,14 @@ class TestAgendarCita:
         assert result["status"] == "fecha_invalida"
 
     async def test_rejects_double_booking_and_offers_alternativas(
-        self, db_session, clinic, lead, lead2, conv, treatment
+        self, db_session, clinic, lead, lead2, conv, treatment, now_lima
     ):
         ctx1 = _ctx(db_session, clinic, conv, lead)
         first = json.loads(
             await _handle_agendar_cita(
-                ctx1, {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Limpieza Dental"}
+                ctx1,
+                {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Limpieza Dental"},
+                now=now_lima,
             )
         )
         assert first["status"] == "scheduled"
@@ -409,7 +433,9 @@ class TestAgendarCita:
         ctx2 = _ctx(db_session, clinic, conv, lead2)
         second = json.loads(
             await _handle_agendar_cita(
-                ctx2, {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Limpieza Dental"}
+                ctx2,
+                {"fecha_hora": "2026-07-06T10:00", "tratamiento": "Limpieza Dental"},
+                now=now_lima,
             )
         )
 
@@ -421,7 +447,7 @@ class TestAgendarCita:
         assert row is not None
 
     async def test_conflict_at_lima_20h_offers_alternatives_for_same_local_day(
-        self, db_session, clinic, lead, lead2, conv, treatment
+        self, db_session, clinic, lead, lead2, conv, treatment, now_lima
     ):
         """Regression/invariant test for the day-boundary case: a clash at
         20:00 America/Lima (UTC-5) is 01:00 UTC the *next* calendar day.
@@ -442,7 +468,9 @@ class TestAgendarCita:
         ctx1 = _ctx(db_session, clinic, conv, lead)
         first = json.loads(
             await _handle_agendar_cita(
-                ctx1, {"fecha_hora": "2026-07-06T20:00", "tratamiento": "Limpieza Dental"}
+                ctx1,
+                {"fecha_hora": "2026-07-06T20:00", "tratamiento": "Limpieza Dental"},
+                now=now_lima,
             )
         )
         assert first["status"] == "scheduled"
@@ -450,7 +478,9 @@ class TestAgendarCita:
         ctx2 = _ctx(db_session, clinic, conv, lead2)
         second = json.loads(
             await _handle_agendar_cita(
-                ctx2, {"fecha_hora": "2026-07-06T20:00", "tratamiento": "Limpieza Dental"}
+                ctx2,
+                {"fecha_hora": "2026-07-06T20:00", "tratamiento": "Limpieza Dental"},
+                now=now_lima,
             )
         )
 
@@ -468,8 +498,6 @@ class TestAgendarCita:
 # so they stay deterministic regardless of the wall-clock date the suite
 # happens to run on.
 # ---------------------------------------------------------------------------
-
-_LIMA = ZoneInfo("America/Lima")
 
 
 class TestAgendarCitaValidations:

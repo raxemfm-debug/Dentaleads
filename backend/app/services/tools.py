@@ -293,7 +293,7 @@ async def _handle_agendar_cita(
     except IntegrityError:
         # solo revierte al savepoint; la sesión sigue viva
         alternativas = await AvailabilityService.get_available_slots(
-            ctx.db, ctx.clinic, local_date_str
+            ctx.db, ctx.clinic, local_date_str, today=current.date()
         )
         return json.dumps(
             {"status": "slot_no_disponible", "alternativas": alternativas.get("slots", [])},
