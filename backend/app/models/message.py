@@ -1,7 +1,7 @@
 import uuid
 from typing import TYPE_CHECKING
 
-from sqlalchemy import ForeignKey, Index, String, Text
+from sqlalchemy import ForeignKey, Index, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.database import Base
@@ -21,15 +21,24 @@ class Message(UUIDMixin, TimestampMixin, Base):
         # Only inbound (role="user") rows carry a wamid; assistant rows leave it NULL,
         # and NULL is not compared equal to NULL by a unique index, so those never collide.
         Index("uq_messages_wamid", "wamid", unique=True),
+        # DT-001: history reconstruction orders by `sequence`, not `created_at`. Postgres's
+        # now()/CURRENT_TIMESTAMP is stable within a transaction, so every row persisted by
+        # the same handle() call (tool_use + tool_result(s) + final assistant reply) shares
+        # an identical created_at — ordering by it alone leaves same-call rows in undefined
+        # relative order, which can send Anthropic a tool_result with no preceding tool_use.
+        Index("ix_messages_conversation_id_sequence", "conversation_id", "sequence"),
     )
 
     conversation_id: Mapped[uuid.UUID] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("conversations.id", ondelete="CASCADE"),
         nullable=False,
-        index=True,
     )
-    role: Mapped[str] = mapped_column(String(20), nullable=False)  # user | assistant | system
+    # Monotonic per-conversation counter assigned in application code (not a DB identity/
+    # autoincrement column) so it behaves identically on Postgres and the SQLite test engine.
+    sequence: Mapped[int] = mapped_column(Integer, nullable=False)
+    # user | assistant | tool_use | tool_result
+    role: Mapped[str] = mapped_column(String(20), nullable=False)
     content: Mapped[str] = mapped_column(Text, nullable=False)
     wamid: Mapped[str | None] = mapped_column(String(100), nullable=True)
     metadata_: Mapped[dict] = mapped_column("metadata", JSONB, default=dict, nullable=False)

@@ -168,13 +168,22 @@ def _persist_exchange(
     inbound_text: str,
     assistant_text: str,
     assistant_metadata: dict,
+    user_sequence: int,
+    assistant_sequence: int,
 ) -> None:
+    """Persist the inbound row and the final assistant reply.
+
+    The two sequence numbers are not assumed adjacent: when the loop executed tools,
+    the tool_use/tool_result rows _persist_tool_turns wrote occupy the numbers between
+    them (DT-001) — see handle() for how the numbering is threaded through.
+    """
     db.add(
         Message(
             conversation_id=conv.id,
             role="user",
             content=inbound_text,
             wamid=msg.message_id or None,
+            sequence=user_sequence,
             metadata_={"message_id": msg.message_id, "message_type": msg.message_type},
         )
     )
@@ -183,10 +192,114 @@ def _persist_exchange(
             conversation_id=conv.id,
             role="assistant",
             content=assistant_text,
+            sequence=assistant_sequence,
             metadata_=assistant_metadata,
         )
     )
     conv.last_message_at = datetime.now(timezone.utc)
+
+
+def _persist_tool_turns(
+    db: AsyncSession,
+    conv: Conversation,
+    tool_turns: list[LLMMessage],
+    next_sequence: int,
+) -> int:
+    """Persist the assistant tool_use / tool_result turns _run_llm_loop appended (DT-001).
+
+    tool_turns is the slice of llm_messages the tool loop produced beyond the inbound
+    turn — alternating "assistant" (with tool_calls) and "tool_result" LLMMessages, one
+    tool_result row per tool call executed, even when a single turn requests several.
+    Storage roles ("tool_use"/"tool_result") are distinct from the wire-protocol roles
+    LLMMessage uses ("assistant"/"tool_result") — see _rows_to_llm_messages for the
+    reverse mapping when history is reloaded.
+
+    tool_name is looked up from the sibling tool_use turn's tool_calls and stored only
+    in metadata_ for audit/debugging; it is never sent back to Anthropic, so LLMMessage
+    itself gains no new field for it.
+
+    Returns the next free sequence number, so the caller can chain the final
+    exchange's rows after these without re-querying MAX(sequence).
+    """
+    tool_names_by_call_id: dict[str, str] = {}
+    seq = next_sequence
+    for turn in tool_turns:
+        if turn.role == "assistant" and turn.tool_calls:
+            for call in turn.tool_calls:
+                tool_names_by_call_id[call["id"]] = call["name"]
+            db.add(
+                Message(
+                    conversation_id=conv.id,
+                    role="tool_use",
+                    content=turn.content or "",
+                    sequence=seq,
+                    metadata_={"tool_calls": turn.tool_calls},
+                )
+            )
+            seq += 1
+        elif turn.role == "tool_result":
+            db.add(
+                Message(
+                    conversation_id=conv.id,
+                    role="tool_result",
+                    content=turn.content,
+                    sequence=seq,
+                    metadata_={
+                        "tool_call_id": turn.tool_call_id,
+                        "tool_name": tool_names_by_call_id.get(turn.tool_call_id),
+                    },
+                )
+            )
+            seq += 1
+    return seq
+
+
+def _trim_to_user_boundary(rows: list[Message]) -> list[Message]:
+    """Drop leading rows until the window starts at a role="user" row (DT-001).
+
+    Anthropic requires the message list to start with role="user". HISTORY_LIMIT caps
+    the window to a fixed row count, and a tool-calling turn now spans several rows
+    (tool_use + tool_result(s) + assistant) instead of one — the cut can land inside a
+    turn, leaving a leading tool_use or tool_result with no valid predecessor in the
+    window. Trimming to the first user row guarantees a structurally valid window, at
+    the cost of occasionally sending fewer than HISTORY_LIMIT rows. If no user row
+    exists in the window at all, returns an empty list rather than risk sending an
+    invalid one — the caller still appends the new inbound turn afterwards.
+    """
+    for i, row in enumerate(rows):
+        if row.role == "user":
+            return rows[i:]
+    return []
+
+
+def _rows_to_llm_messages(rows: list[Message]) -> list[LLMMessage]:
+    """Map persisted Message rows back to the LLMMessage shape _run_llm_loop expects.
+
+    Storage roles "tool_use"/"tool_result" are reconstructed into the wire-protocol
+    shape ClaudeProvider._to_anthropic_messages understands: a tool_use row becomes an
+    "assistant" turn carrying tool_calls, and a tool_result row keeps its tool_call_id.
+    """
+    llm_messages: list[LLMMessage] = []
+    for row in rows:
+        if row.role in ("user", "assistant"):
+            llm_messages.append(LLMMessage(role=row.role, content=row.content))
+        elif row.role == "tool_use":
+            llm_messages.append(
+                LLMMessage(
+                    role="assistant",
+                    content=row.content,
+                    tool_calls=row.metadata_.get("tool_calls"),
+                )
+            )
+        elif row.role == "tool_result":
+            llm_messages.append(
+                LLMMessage(
+                    role="tool_result",
+                    content=row.content,
+                    tool_call_id=row.metadata_.get("tool_call_id"),
+                )
+            )
+    return llm_messages
 
 
 async def _send_reply(messaging: MessagingProvider, to_number: str, text: str) -> None:
@@ -277,29 +390,22 @@ async def handle(
     # 3. Resolve active conversation
     conv = await _get_or_create_conversation(db, clinic.id, lead.id)
 
-    # 4. Load the N most recent messages, then reverse to chronological ascending
-    #    for the LLM context window. Query runs before the inbound is persisted,
-    #    so the current message is not in history — it is added once via append below.
-    history_rows = list(
-        reversed(
-            (
-                await db.execute(
-                    select(Message)
-                    .where(Message.conversation_id == conv.id)
-                    .order_by(Message.created_at.desc())
-                    .limit(history_limit)
-                )
-            )
-            .scalars()
-            .all()
+    # 4. Load the N most recent messages (ordered by sequence, not created_at — see
+    #    Message.__table_args__ for why), then reverse to chronological ascending for
+    #    the LLM context window. Query runs before the inbound is persisted, so the
+    #    current message is not in history — it is added once via append below.
+    recent_rows = (
+        await db.execute(
+            select(Message)
+            .where(Message.conversation_id == conv.id)
+            .order_by(Message.sequence.desc())
+            .limit(history_limit)
         )
-    )
+    ).scalars().all()
+    next_sequence = recent_rows[0].sequence + 1 if recent_rows else 0
 
-    llm_messages = [
-        LLMMessage(role=row.role, content=row.content)
-        for row in history_rows
-        if row.role in ("user", "assistant")
-    ]
+    history_rows = _trim_to_user_boundary(list(reversed(recent_rows)))
+    llm_messages = _rows_to_llm_messages(history_rows)
 
     # 5. Build system prompt from clinic.config
     system_prompt = _build_system_prompt(clinic)
@@ -310,6 +416,7 @@ async def handle(
 
     # 7. Run the agentic tool-calling loop
     ctx = ToolContext(db=db, clinic=clinic, conv=conv, lead=lead)
+    history_len = len(llm_messages)
     try:
         response = await _run_llm_loop(llm, system_prompt, llm_messages, DISPATCHER, ctx)
     except LLMProviderError:
@@ -323,26 +430,32 @@ async def handle(
             clinic.id, conv.id, msg.from_number,
             exc_info=True,
         )
+        # Any tool turns the loop already completed before the failing complete() call
+        # (e.g. iteration 2 fails after iteration 1's tool ran) are persisted too —
+        # otherwise a real tool side effect (like an appointment) would leave no trace.
+        tool_turns = llm_messages[history_len:]
+        assistant_sequence = _persist_tool_turns(db, conv, tool_turns, next_sequence + 1)
         _persist_exchange(
             db, conv, msg, inbound_text,
             LLM_FALLBACK_MESSAGE,
             {"stop_reason": "llm_provider_error"},
+            user_sequence=next_sequence,
+            assistant_sequence=assistant_sequence,
         )
         await db.flush()
         await _send_reply(messaging, msg.from_number, LLM_FALLBACK_MESSAGE)
         return
 
-    # TODO(deuda): los intercambios intermedios del loop (turnos assistant tool_use +
-    # tool_results) no se persisten; solo se guarda la respuesta final de texto.
-    # Post-MVP: persistir el rastro completo de tool calls en la tabla messages
-    # (con role="tool_use" / "tool_result" y metadata_ con inputs/outputs) para
-    # facilitar la depuración de conversaciones y la auditoría del comportamiento del bot.
-
-    # 8. Persist inbound + assistant response together, then refresh conversation timestamp
+    # 8. Persist the tool_use/tool_result turns the loop produced (DT-001), then the
+    #    inbound + final assistant response, and refresh the conversation timestamp.
+    tool_turns = llm_messages[history_len:]
+    assistant_sequence = _persist_tool_turns(db, conv, tool_turns, next_sequence + 1)
     _persist_exchange(
         db, conv, msg, inbound_text,
         response.content,
         {"stop_reason": response.stop_reason, "usage": response.usage},
+        user_sequence=next_sequence,
+        assistant_sequence=assistant_sequence,
     )
     await db.flush()
 

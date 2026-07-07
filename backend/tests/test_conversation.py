@@ -1,4 +1,5 @@
 """Tests for conversation.handle()."""
+import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -7,7 +8,7 @@ import pytest_asyncio
 from sqlalchemy import select
 
 from app.core.exceptions import TenantNotFoundError
-from app.core.providers import InboundMessage
+from app.core.providers import InboundMessage, LLMResponse
 from app.models.clinic import Clinic
 from app.models.conversation import Conversation
 from app.models.lead import Lead
@@ -16,6 +17,8 @@ from app.services.conversation import (
     HISTORY_LIMIT,
     LLM_FALLBACK_MESSAGE,
     _build_system_prompt,
+    _rows_to_llm_messages,
+    _trim_to_user_boundary,
     handle,
     is_wamid_processed,
 )
@@ -24,6 +27,7 @@ from tests.fakes import (
     FailingMessagingProvider,
     FakeLLMProvider,
     FakeMessagingProvider,
+    SequencedFakeLLMProvider,
     SpyFakeLLMProvider,
 )
 
@@ -177,16 +181,16 @@ async def test_inbound_appears_exactly_once_in_llm_context(db_session, clinic):
 
 
 async def test_history_sent_to_llm_in_chronological_order(db_session, clinic):
-    """History rows with distinct timestamps reach the LLM oldest-first; inbound is last.
+    """History rows reach the LLM oldest-first (by sequence); inbound is last.
 
-    Messages inserted in the same flush share an identical SQLite timestamp, making
-    same-flush ordering undefined. We seed prior messages with explicit timestamps
-    so the ordering assertion is deterministic.
+    Messages inserted in the same flush share an identical SQLite/Postgres timestamp
+    (DT-001), so ordering is by the explicit `sequence` we seed here, not created_at.
     """
     spy = SpyFakeLLMProvider()
     messaging = FakeMessagingProvider()
 
-    # Bootstrap to create lead + conversation, then seed history with explicit timestamps.
+    # Bootstrap to create lead + conversation (consumes sequence 0 and 1), then seed
+    # more history explicitly continuing the sequence.
     await handle(_msg(text="bootstrap", msg_id="wamid-bootstrap"), db_session, messaging, FakeLLMProvider())
     conv = (await db_session.execute(
         select(Conversation).where(Conversation.tenant_id == clinic.id)
@@ -195,9 +199,9 @@ async def test_history_sent_to_llm_in_chronological_order(db_session, clinic):
     t1 = datetime(2020, 1, 1, 0, 0, tzinfo=timezone.utc)
     t2 = datetime(2020, 1, 1, 1, 0, tzinfo=timezone.utc)
     db_session.add(Message(conversation_id=conv.id, role="user", content="primera pregunta",
-                           metadata_={}, created_at=t1, updated_at=t1))
+                           metadata_={}, sequence=2, created_at=t1, updated_at=t1))
     db_session.add(Message(conversation_id=conv.id, role="assistant", content="primera respuesta",
-                           metadata_={}, created_at=t2, updated_at=t2))
+                           metadata_={}, sequence=3, created_at=t2, updated_at=t2))
     await db_session.flush()
 
     await handle(_msg(text="segunda pregunta", msg_id="wamid-segunda"), db_session, messaging, spy)
@@ -357,8 +361,9 @@ async def test_history_limited_to_history_limit(db_session, clinic):
         select(Conversation).where(Conversation.tenant_id == clinic.id)
     )).scalars().first()
 
-    # Seed more than HISTORY_LIMIT messages with explicit future timestamps so their
-    # ordering is deterministic and they rank as the most recent rows in the query.
+    # Seed more than HISTORY_LIMIT messages with explicit sequence numbers (continuing
+    # after the bootstrap pair's 0/1) so ordering is deterministic regardless of
+    # same-flush timestamp ties (DT-001).
     base = datetime(2030, 1, 1, tzinfo=timezone.utc)
     for i in range(HISTORY_LIMIT + 5):
         db_session.add(Message(
@@ -366,6 +371,7 @@ async def test_history_limited_to_history_limit(db_session, clinic):
             role="user",
             content=f"old msg {i}",
             metadata_={},
+            sequence=2 + i,
             created_at=base + timedelta(minutes=i),
             updated_at=base + timedelta(minutes=i),
         ))
@@ -376,6 +382,145 @@ async def test_history_limited_to_history_limit(db_session, clinic):
     # HISTORY_LIMIT historical rows fetched + 1 inbound appended
     assert len(spy.calls[0]) == HISTORY_LIMIT + 1
     assert spy.calls[0][-1].content == "nuevo"
+
+
+# ---------------------------------------------------------------------------
+# Tool turn persistence and memory (DT-001)
+# ---------------------------------------------------------------------------
+
+def _tool_use_response(tool_id: str = "toolu_abc", tool_name: str = "herramienta_test") -> LLMResponse:
+    return LLMResponse(
+        content="Voy a revisar.",
+        tool_calls=[{"id": tool_id, "name": tool_name, "inputs": {"x": 1}}],
+        stop_reason="tool_use",
+        usage={"input_tokens": 10, "output_tokens": 5},
+    )
+
+
+def _end_turn_response(content: str) -> LLMResponse:
+    return LLMResponse(
+        content=content,
+        tool_calls=[],
+        stop_reason="end_turn",
+        usage={"input_tokens": 5, "output_tokens": 5},
+    )
+
+
+async def test_persists_tool_use_and_tool_result_rows(db_session, clinic):
+    """A tool-calling turn persists 4 rows in order: user, tool_use, tool_result, assistant.
+
+    herramienta_test is not registered in the production dispatcher, so dispatch()
+    returns a contained error tool_result (same behavior test_tools.py exercises for
+    an unknown tool) — irrelevant here, since this test only cares about how the turn
+    gets persisted, not about any specific tool's business logic.
+    """
+    llm = SequencedFakeLLMProvider([
+        _tool_use_response(),
+        _end_turn_response("Listo."),
+    ])
+    await handle(_msg(text="Necesito ayuda", msg_id="wamid-tool-1"), db_session, FakeMessagingProvider(), llm)
+
+    conv = (await db_session.execute(
+        select(Conversation).where(Conversation.tenant_id == clinic.id)
+    )).scalars().first()
+    msgs = (await db_session.execute(
+        select(Message).where(Message.conversation_id == conv.id).order_by(Message.sequence.asc())
+    )).scalars().all()
+
+    assert [m.role for m in msgs] == ["user", "tool_use", "tool_result", "assistant"]
+    assert [m.sequence for m in msgs] == [0, 1, 2, 3]
+    assert msgs[1].metadata_["tool_calls"] == [
+        {"id": "toolu_abc", "name": "herramienta_test", "inputs": {"x": 1}}
+    ]
+    assert msgs[2].metadata_["tool_call_id"] == "toolu_abc"
+    assert msgs[2].metadata_["tool_name"] == "herramienta_test"
+    assert msgs[3].content == "Listo."
+
+
+async def test_tool_turns_visible_in_next_turn_context(db_session, clinic):
+    """DT-001 live finding: after a tool-calling turn, the next turn's LLM context must
+    include the assistant's tool_use turn and its tool_result — the model can no longer
+    be blind to a tool call it already made, which is what let a "gracias" re-trigger
+    agendar_cita on an already-confirmed slot."""
+    first_llm = SequencedFakeLLMProvider([
+        _tool_use_response(),
+        _end_turn_response("Listo, tienes turno el viernes."),
+    ])
+    messaging = FakeMessagingProvider()
+    await handle(_msg(text="Quiero agendar", msg_id="wamid-1"), db_session, messaging, first_llm)
+
+    spy = SpyFakeLLMProvider()
+    await handle(_msg(text="gracias", msg_id="wamid-2"), db_session, messaging, spy)
+
+    sent = spy.calls[0]
+    tool_use_msgs = [m for m in sent if m.role == "assistant" and m.tool_calls]
+    tool_result_msgs = [m for m in sent if m.role == "tool_result"]
+    assert len(tool_use_msgs) == 1
+    assert tool_use_msgs[0].tool_calls == [
+        {"id": "toolu_abc", "name": "herramienta_test", "inputs": {"x": 1}}
+    ]
+    assert len(tool_result_msgs) == 1
+    assert tool_result_msgs[0].tool_call_id == "toolu_abc"
+
+
+# ---------------------------------------------------------------------------
+# HISTORY_LIMIT window trimming — no dangling tool_result (DT-001)
+#
+# _trim_to_user_boundary and _rows_to_llm_messages are pure functions of a row list,
+# so these construct Message objects directly (never persisted) rather than going
+# through db_session — no DB round-trip needed to exercise the trimming logic.
+# ---------------------------------------------------------------------------
+
+def _row(role: str, content: str = "", metadata: dict | None = None, sequence: int = 0) -> Message:
+    return Message(
+        conversation_id=uuid.uuid4(),
+        role=role,
+        content=content,
+        metadata_=metadata or {},
+        sequence=sequence,
+    )
+
+
+def test_trim_drops_dangling_tool_result_at_window_start():
+    """A window cut mid-turn can start with a tool_result whose tool_use fell outside
+    it (or even a lone tool_use with no result yet inside the window) — both are
+    invalid as the first message Anthropic receives. Trimming to the next user row
+    must drop them."""
+    rows = [
+        _row("tool_result", content="{}", metadata={"tool_call_id": "t0"}, sequence=5),
+        _row("assistant", content="ya usó una tool", sequence=6),
+        _row("user", content="segunda pregunta", sequence=7),
+        _row("tool_use", content="", metadata={
+            "tool_calls": [{"id": "t1", "name": "verificar_disponibilidad", "inputs": {}}]
+        }, sequence=8),
+        _row("tool_result", content="{}", metadata={"tool_call_id": "t1"}, sequence=9),
+        _row("assistant", content="respuesta", sequence=10),
+    ]
+
+    trimmed = _trim_to_user_boundary(rows)
+
+    assert trimmed[0].role == "user"
+    assert trimmed[0].content == "segunda pregunta"
+
+    llm_msgs = _rows_to_llm_messages(trimmed)
+    assert llm_msgs[0].role == "user"
+    # No dangling tool_result: every tool_result's tool_call_id has a preceding
+    # assistant turn whose tool_calls contains a matching id.
+    seen_call_ids: set[str] = set()
+    for m in llm_msgs:
+        if m.role == "assistant" and m.tool_calls:
+            seen_call_ids.update(tc["id"] for tc in m.tool_calls)
+        elif m.role == "tool_result":
+            assert m.tool_call_id in seen_call_ids
+
+
+def test_trim_returns_empty_when_no_user_row_in_window():
+    rows = [
+        _row("tool_use", metadata={"tool_calls": [{"id": "t0", "name": "x", "inputs": {}}]}, sequence=1),
+        _row("tool_result", metadata={"tool_call_id": "t0"}, sequence=2),
+    ]
+
+    assert _trim_to_user_boundary(rows) == []
 
 
 # ---------------------------------------------------------------------------
