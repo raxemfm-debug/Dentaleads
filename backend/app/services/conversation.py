@@ -58,7 +58,12 @@ def _format_fecha_actual(now: datetime, tz_name: str) -> str:
     return (
         f"Hoy es {dia} {now.day} de {mes} de {now.year}, {now:%H:%M} ({tz_name}). "
         'Interpreta toda fecha relativa ("el viernes", "mañana") respecto a HOY '
-        "y nunca propongas fechas pasadas."
+        "y nunca propongas fechas pasadas. "
+        "Nunca vuelvas a agendar una cita que ya quedó confirmada en esta misma "
+        "conversación. "
+        'Los mensajes puramente sociales (agradecimientos, despedidas, confirmaciones '
+        'como "ok" o "gracias") no requieren usar herramientas: respóndelos solo con '
+        "texto."
     )
 
 
