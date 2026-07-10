@@ -26,6 +26,10 @@ logger = logging.getLogger("seed_dev")
 CLINIC_WHATSAPP_PHONE_ID = "1162389980294305"
 CLINIC_NAME = "Clínica Dental Demo"
 CLINIC_TIMEZONE = "America/Lima"
+CLINIC_ADDRESS = "Av. Javier Prado Este 1234, San Isidro, Lima"
+CLINIC_ADDRESS_REFERENCE = "Frente al parque Óscar Benavides, edificio azul, piso 2"
+CLINIC_MAPS_URL = "https://maps.app.goo.gl/dentalbotDemoClinic"
+CLINIC_CONTACT_PHONE = "+51 1 234 5678"
 
 BUSINESS_HOURS = {
     "slot_duration_minutes": 30,
@@ -65,6 +69,22 @@ TREATMENTS = [
 ]
 
 
+def _backfill_location(clinic: Clinic) -> None:
+    """Fill missing location fields on an already-seeded clinic.
+
+    Only touches fields still at None, so a clinic customized by hand (or
+    seeded before these columns existed) doesn't get its real data clobbered.
+    """
+    if clinic.address is None:
+        clinic.address = CLINIC_ADDRESS
+    if clinic.address_reference is None:
+        clinic.address_reference = CLINIC_ADDRESS_REFERENCE
+    if clinic.maps_url is None:
+        clinic.maps_url = CLINIC_MAPS_URL
+    if clinic.contact_phone is None:
+        clinic.contact_phone = CLINIC_CONTACT_PHONE
+
+
 async def _get_or_create_clinic(db) -> tuple[Clinic, bool]:
     clinic = (
         await db.execute(
@@ -72,12 +92,17 @@ async def _get_or_create_clinic(db) -> tuple[Clinic, bool]:
         )
     ).scalars().first()
     if clinic is not None:
+        _backfill_location(clinic)
         return clinic, False
 
     clinic = Clinic(
         name=CLINIC_NAME,
         whatsapp_phone_id=CLINIC_WHATSAPP_PHONE_ID,
         timezone=CLINIC_TIMEZONE,
+        address=CLINIC_ADDRESS,
+        address_reference=CLINIC_ADDRESS_REFERENCE,
+        maps_url=CLINIC_MAPS_URL,
+        contact_phone=CLINIC_CONTACT_PHONE,
         business_hours=BUSINESS_HOURS,
         config={},
     )

@@ -22,6 +22,9 @@ class Clinic(UUIDMixin, TimestampMixin, Base):
     whatsapp_phone_id: Mapped[str] = mapped_column(String(100), unique=True, nullable=False)
     timezone: Mapped[str] = mapped_column(String(50), default="UTC", nullable=False)
     address: Mapped[str | None] = mapped_column(Text)
+    address_reference: Mapped[str | None] = mapped_column(Text)
+    maps_url: Mapped[str | None] = mapped_column(String(500))
+    contact_phone: Mapped[str | None] = mapped_column(String(50))
     business_hours: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     config: Mapped[dict] = mapped_column(JSONB, default=dict, nullable=False)
     subscription_status: Mapped[str] = mapped_column(

@@ -573,3 +573,66 @@ def test_system_prompt_falls_back_to_utc_on_invalid_timezone():
     prompt = _build_system_prompt(clinic, now=frozen_now)
 
     assert "Hoy es domingo 5 de julio de 2026, 12:00 (Nowhere/Fake)." in prompt
+
+
+# ---------------------------------------------------------------------------
+# System prompt — ficha de la clínica (ubicación/contacto)
+# ---------------------------------------------------------------------------
+
+def test_system_prompt_contains_ficha_clinica_for_correct_tenant():
+    clinic = Clinic(
+        name="Clínica Test",
+        whatsapp_phone_id="phone-ficha",
+        timezone="America/Lima",
+        address="Av. Siempre Viva 742, Lima",
+        address_reference="Frente a la plaza principal",
+        maps_url="https://maps.app.goo.gl/ejemplo",
+        contact_phone="+51 1 111 2222",
+        config={},
+    )
+    frozen_now = datetime(2026, 7, 5, 9, 53, tzinfo=ZoneInfo("America/Lima"))
+
+    prompt = _build_system_prompt(clinic, now=frozen_now)
+
+    assert "Ficha de la clínica:" in prompt
+    assert "- Dirección: Av. Siempre Viva 742, Lima" in prompt
+    assert "- Referencia: Frente a la plaza principal" in prompt
+    assert "- Cómo llegar (Google Maps): https://maps.app.goo.gl/ejemplo" in prompt
+    assert "- Teléfono de contacto: +51 1 111 2222" in prompt
+    assert "Nunca inventes una dirección, un link de Maps o un teléfono" in prompt
+
+
+def test_system_prompt_ficha_clinica_isolated_per_tenant():
+    """Otro tenant con su propia dirección no debe filtrar datos de otra clínica."""
+    clinic_a = Clinic(
+        name="Clínica A", whatsapp_phone_id="phone-a",
+        address="Calle A 123", config={},
+    )
+    clinic_b = Clinic(
+        name="Clínica B", whatsapp_phone_id="phone-b",
+        address="Calle B 456", config={},
+    )
+
+    prompt_a = _build_system_prompt(clinic_a)
+    prompt_b = _build_system_prompt(clinic_b)
+
+    assert "Calle A 123" in prompt_a
+    assert "Calle B 456" not in prompt_a
+    assert "Calle B 456" in prompt_b
+    assert "Calle A 123" not in prompt_b
+
+
+def test_system_prompt_ficha_clinica_sin_datos_de_ubicacion():
+    """Sin ninguna dirección/telefono configurados, el bot debe admitirlo, no inventar."""
+    clinic = Clinic(
+        name="Clínica Sin Ubicación",
+        whatsapp_phone_id="phone-sin-ubicacion",
+        config={},
+    )
+
+    prompt = _build_system_prompt(clinic)
+
+    assert "Ficha de la clínica:" in prompt
+    assert "(Sin datos de ubicación configurados todavía.)" in prompt
+    assert "Nunca inventes una dirección, un link de Maps o un teléfono" in prompt
+    assert "dilo honestamente y ofrece derivar a un humano" in prompt

@@ -67,6 +67,30 @@ def _format_fecha_actual(now: datetime, tz_name: str) -> str:
     )
 
 
+def _format_ficha_clinica(clinic: Clinic) -> str:
+    """Compose the "Ficha de la clínica" block injected into the system prompt.
+
+    Only lists fields actually configured on the clinic. The model must never
+    invent a missing address/maps link/phone (health-adjacent trust context) —
+    it must say so honestly and offer to derive to a human instead.
+    """
+    campos = [
+        ("Dirección", clinic.address),
+        ("Referencia", clinic.address_reference),
+        ("Cómo llegar (Google Maps)", clinic.maps_url),
+        ("Teléfono de contacto", clinic.contact_phone),
+    ]
+    lineas = [f"- {label}: {valor}" for label, valor in campos if valor]
+    cuerpo = "\n".join(lineas) if lineas else "- (Sin datos de ubicación configurados todavía.)"
+    return (
+        "Ficha de la clínica:\n"
+        f"{cuerpo}\n"
+        "Si el paciente pregunta por la ubicación y falta algún dato de esta ficha, "
+        "dilo honestamente y ofrece derivar a un humano para confirmarlo. Nunca "
+        "inventes una dirección, un link de Maps o un teléfono que no esté aquí."
+    )
+
+
 def _build_system_prompt(clinic: Clinic, *, now: datetime | None = None) -> str:
     """Compose the clinic's system prompt, prefixed with the current date/time.
 
@@ -93,7 +117,8 @@ def _build_system_prompt(clinic: Clinic, *, now: datetime | None = None) -> str:
 
     current = now if now is not None else datetime.now(tz=tz)
     fecha_actual = _format_fecha_actual(current, clinic.timezone or "UTC")
-    return f"{fecha_actual}\n\n{base}"
+    ficha_clinica = _format_ficha_clinica(clinic)
+    return f"{fecha_actual}\n\n{ficha_clinica}\n\n{base}"
 
 
 async def is_wamid_processed(db: AsyncSession, wamid: str) -> bool:
