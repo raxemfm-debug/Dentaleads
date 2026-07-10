@@ -210,6 +210,18 @@ async def _get_or_create_conversation(
     tenant_id,
     lead_id,
 ) -> Conversation:
+    """Resolve the active conversation, locking the row for the rest of the request (DT-006).
+
+    with_for_update() takes a row lock held until this request's transaction commits
+    (get_db() commits once at the end of handle()). A second concurrent webhook for the
+    same conversation blocks here until the first fully finishes — Postgres re-checks the
+    row once unblocked, so next_sequence in handle() always sees the first call's committed
+    rows, and the two calls' turns can never interleave in the reply sent back to the
+    patient. On the SQLite engine the test suite uses, with_for_update() compiles to a
+    no-op (verified), so this has no effect on single-threaded tests. A brand-new
+    conversation (the `conv is None` branch below) needs no lock: the row we just inserted
+    is invisible to other transactions until we commit, so it's implicitly exclusive.
+    """
     conv = (
         await db.execute(
             select(Conversation)
@@ -220,6 +232,7 @@ async def _get_or_create_conversation(
             )
             .order_by(Conversation.last_message_at.desc())
             .limit(1)
+            .with_for_update()
         )
     ).scalars().first()
     if conv is None:

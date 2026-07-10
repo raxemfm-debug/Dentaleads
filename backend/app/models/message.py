@@ -26,7 +26,14 @@ class Message(UUIDMixin, TimestampMixin, Base):
         # the same handle() call (tool_use + tool_result(s) + final assistant reply) shares
         # an identical created_at — ordering by it alone leaves same-call rows in undefined
         # relative order, which can send Anthropic a tool_result with no preceding tool_use.
-        Index("ix_messages_conversation_id_sequence", "conversation_id", "sequence"),
+        # DT-006: unique (not just indexed) as of migration a9b593a43546. sequence was
+        # assigned in Python as max()+1 with no locking, so two webhooks racing on the same
+        # conversation could both read the same max and both insert the same number — the
+        # conversation.py fix (with_for_update in _get_or_create_conversation) is the primary
+        # guard; this constraint is the DB-level backstop that vetoes it outright if that
+        # guard is ever bypassed. Enforced on the SQLite test engine too, since tests build
+        # schema via Base.metadata.create_all() rather than Alembic.
+        Index("uq_messages_conversation_id_sequence", "conversation_id", "sequence", unique=True),
     )
 
     conversation_id: Mapped[uuid.UUID] = mapped_column(
