@@ -26,6 +26,7 @@ from app.models.clinic import Clinic
 from app.models.conversation import Conversation
 from app.models.lead import Lead
 from app.models.message import Message
+from app.models.treatment import Treatment
 from app.services.availability import resolve_clinic_timezone
 from app.services.tools import DENTAL_TOOLS, DISPATCHER, ToolContext, ToolDispatcher
 
@@ -63,7 +64,10 @@ def _format_fecha_actual(now: datetime, tz_name: str) -> str:
         "conversación. "
         'Los mensajes puramente sociales (agradecimientos, despedidas, confirmaciones '
         'como "ok" o "gracias") no requieren usar herramientas: respóndelos solo con '
-        "texto."
+        "texto. "
+        "Antes de pedir datos para agendar una cita, revisa la Ficha del paciente y "
+        "el historial reciente: pide solo los datos que falten y nunca vuelvas a "
+        "pedir uno que ya conoces (por ejemplo el nombre)."
     )
 
 
@@ -91,7 +95,36 @@ def _format_ficha_clinica(clinic: Clinic) -> str:
     )
 
 
-def _build_system_prompt(clinic: Clinic, *, now: datetime | None = None) -> str:
+def _format_ficha_paciente(lead: Lead, treatment_name: str | None) -> str:
+    """Compose the "Ficha del paciente" block injected into the system prompt.
+
+    Surfaces data already known for this WhatsApp number (leads.name, tratamiento
+    de interés) so the model still sees it once it scrolls out of the persisted
+    history window (HISTORY_LIMIT) — without this, the scheduling script re-asks
+    for a name the bot already has on file for this number.
+    """
+    campos = [
+        ("Nombre", lead.name),
+        ("Tratamiento de interés", treatment_name),
+    ]
+    lineas = [f"- {label}: {valor}" for label, valor in campos if valor]
+    if not lineas:
+        return "Ficha del paciente:\n- (Sin datos guardados todavía para este número.)"
+    return (
+        "Ficha del paciente:\n"
+        + "\n".join(lineas)
+        + "\nEstos datos ya se conocen: no los vuelvas a pedir. Al agendar una cita, "
+        "pide solo lo que falte."
+    )
+
+
+def _build_system_prompt(
+    clinic: Clinic,
+    *,
+    lead: Lead | None = None,
+    treatment_name: str | None = None,
+    now: datetime | None = None,
+) -> str:
     """Compose the clinic's system prompt, prefixed with the current date/time.
 
     now: override for "current time" in tests (mirrors _handle_agendar_cita's
@@ -99,6 +132,12 @@ def _build_system_prompt(clinic: Clinic, *, now: datetime | None = None) -> str:
     depending on wall-clock time. Production callers never pass it. DT-005: without
     this, the model has no notion of "today" and hallucinates dates when resolving
     relative expressions like "el viernes".
+
+    lead/treatment_name: when provided, adds a "Ficha del paciente" block (mirrors
+    _format_ficha_clinica) so the model has leads.name/tratamiento de interés even
+    once they scroll out of the persisted history window. Omitted entirely when
+    lead is None, so callers that only care about the clinic-level prompt (existing
+    tests, any future non-conversational use) are unaffected.
     """
     cfg = clinic.config or {}
     clinic_name = cfg.get("clinic_name") or clinic.name
@@ -118,7 +157,11 @@ def _build_system_prompt(clinic: Clinic, *, now: datetime | None = None) -> str:
     current = now if now is not None else datetime.now(tz=tz)
     fecha_actual = _format_fecha_actual(current, clinic.timezone or "UTC")
     ficha_clinica = _format_ficha_clinica(clinic)
-    return f"{fecha_actual}\n\n{ficha_clinica}\n\n{base}"
+    partes = [fecha_actual, ficha_clinica]
+    if lead is not None:
+        partes.append(_format_ficha_paciente(lead, treatment_name))
+    partes.append(base)
+    return "\n\n".join(partes)
 
 
 async def is_wamid_processed(db: AsyncSession, wamid: str) -> bool:
@@ -437,8 +480,17 @@ async def handle(
     history_rows = _trim_to_user_boundary(list(reversed(recent_rows)))
     llm_messages = _rows_to_llm_messages(history_rows)
 
-    # 5. Build system prompt from clinic.config
-    system_prompt = _build_system_prompt(clinic)
+    # 5. Resolve the treatment already linked to this lead (if any) and build the
+    #    system prompt — the "Ficha del paciente" it injects is what stops the model
+    #    from re-asking for a name/treatment already on file for this number.
+    treatment_name: str | None = None
+    if lead.interested_treatment_id is not None:
+        treatment_name = (
+            await db.execute(
+                select(Treatment.name).where(Treatment.id == lead.interested_treatment_id)
+            )
+        ).scalars().first()
+    system_prompt = _build_system_prompt(clinic, lead=lead, treatment_name=treatment_name)
 
     # 6. Append the inbound turn — exactly once, independent of persist order
     inbound_text = msg.text or ""

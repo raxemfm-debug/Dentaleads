@@ -636,3 +636,73 @@ def test_system_prompt_ficha_clinica_sin_datos_de_ubicacion():
     assert "(Sin datos de ubicación configurados todavía.)" in prompt
     assert "Nunca inventes una dirección, un link de Maps o un teléfono" in prompt
     assert "dilo honestamente y ofrece derivar a un humano" in prompt
+
+
+# ---------------------------------------------------------------------------
+# System prompt — ficha del paciente (evita re-pedir datos ya conocidos)
+# ---------------------------------------------------------------------------
+
+def test_system_prompt_contains_ficha_paciente_when_lead_known():
+    clinic = Clinic(name="Clínica Test", whatsapp_phone_id="phone-ficha-pac", config={})
+    lead = Lead(whatsapp_number="5491100000000", name="Juan Pérez", source="whatsapp", status="new")
+
+    prompt = _build_system_prompt(clinic, lead=lead, treatment_name="Limpieza dental")
+
+    assert "Ficha del paciente:" in prompt
+    assert "- Nombre: Juan Pérez" in prompt
+    assert "- Tratamiento de interés: Limpieza dental" in prompt
+    assert "no los vuelvas a pedir" in prompt
+
+
+def test_system_prompt_ficha_paciente_sin_datos_todavia():
+    clinic = Clinic(name="Clínica Test", whatsapp_phone_id="phone-ficha-pac-2", config={})
+    lead = Lead(whatsapp_number="5491100000001", source="whatsapp", status="new")
+
+    prompt = _build_system_prompt(clinic, lead=lead)
+
+    assert "Ficha del paciente:" in prompt
+    assert "(Sin datos guardados todavía para este número.)" in prompt
+
+
+def test_system_prompt_omits_ficha_paciente_without_lead():
+    """Backward-compat: llamadas sin lead (p.ej. las de ficha_clinica arriba) no cambian."""
+    clinic = Clinic(name="Clínica Test", whatsapp_phone_id="phone-sin-lead", config={})
+
+    prompt = _build_system_prompt(clinic)
+
+    assert "Ficha del paciente:" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# handle() end-to-end — la ficha del paciente evita que el bot re-pida el
+# nombre cuando ya lo conoce para este número de WhatsApp.
+# ---------------------------------------------------------------------------
+
+async def test_handle_does_not_re_ask_name_when_lead_already_known(db_session, clinic):
+    lead = Lead(
+        tenant_id=clinic.id,
+        whatsapp_number="5491155551234",
+        name="Juan Pérez",
+        source="whatsapp",
+        status="new",
+    )
+    db_session.add(lead)
+    await db_session.flush()
+
+    provider = SequencedFakeLLMProvider([_end_turn_response("¿Para qué fecha te gustaría la cita?")])
+
+    await handle(_msg(text="Quisiera agendar una cita"), db_session, FakeMessagingProvider(), provider)
+
+    system_prompt = provider.calls[0]["system_prompt"]
+    assert "Ficha del paciente:" in system_prompt
+    assert "- Nombre: Juan Pérez" in system_prompt
+
+
+async def test_handle_ficha_paciente_sin_datos_para_lead_nuevo(db_session, clinic):
+    provider = SequencedFakeLLMProvider([_end_turn_response("¿Cuál es tu nombre completo?")])
+
+    await handle(_msg(text="Quisiera agendar una cita"), db_session, FakeMessagingProvider(), provider)
+
+    system_prompt = provider.calls[0]["system_prompt"]
+    assert "Ficha del paciente:" in system_prompt
+    assert "(Sin datos guardados todavía para este número.)" in system_prompt
