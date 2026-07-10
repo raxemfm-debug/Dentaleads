@@ -108,7 +108,7 @@ No es un clon completo de ManyChat. Es un producto **vertical y especializado**:
 
 Todas las tablas de negocio incluyen `tenant_id` (FK a `clinics`) salvo `clinics` y `users` globales.
 
-- **clinics** (tenant): `id`, `name`, `whatsapp_phone_id`, `timezone`, `address`, `business_hours` (JSONB), `config` (JSONB), `subscription_status`, `created_at`.
+- **clinics** (tenant): `id`, `name`, `whatsapp_phone_id`, `timezone`, `address`, `address_reference`, `maps_url`, `contact_phone`, `business_hours` (JSONB), `config` (JSONB), `subscription_status`, `created_at`.
 - **clinic_users**: `id`, `tenant_id`, `email`, `password_hash`, `role` (`owner`/`staff`), `name`.
 - **treatments**: `id`, `tenant_id`, `name`, `description`, `duration_minutes`, `price_from`, `requires_consult`.
 - **leads**: `id`, `tenant_id`, `whatsapp_number`, `name`, `interested_treatment_id`, `source`, `status` (`new`/`qualified`/`scheduled`/`lost`), `notes`, `consent_at`, `created_at`.
@@ -126,6 +126,7 @@ El bot debe manejar de forma nativa el dominio dental. Configurable por clínica
 
 - **Tratamientos frecuentes**: limpieza/profilaxis, ortodoncia (brackets/alineadores), implantes, blanqueamiento, endodoncia, extracciones, prótesis, odontopediatría.
 - **Preguntas típicas a resolver**: precios "desde", duración del tratamiento, si requiere valoración previa, formas de pago/financiamiento, horarios, ubicación, si atienden urgencias.
+- **Ubicación y contacto de la clínica**: el system prompt incluye una "Ficha de la clínica" (dirección, referencia, link de Google Maps, teléfono de contacto) inyectada junto a la fecha/hora actual del tenant (`_build_system_prompt` / `_format_ficha_clinica` en `backend/app/services/conversation.py`). Los datos viven en columnas dedicadas de `clinics` (`address`, `address_reference`, `maps_url`, `contact_phone`), no en `config` JSONB, por ser hechos fijos de la clínica y no ajustes de tono/comportamiento. Si a un tenant le falta algún dato, el bot lo admite honestamente y ofrece derivar a un humano — nunca inventa una dirección, link o teléfono. Tests: `backend/tests/test_conversation.py` (ficha por tenant correcto, aislamiento entre tenants, caso sin datos configurados).
 - **Triaje de urgencias**: detectar palabras clave (dolor intenso, golpe, sangrado, hinchazón) y priorizar/derivar a humano con mensaje empático.
 - **Agendamiento**: ofrecer franjas disponibles, confirmar, registrar la cita.
 - **Recordatorios**: 24h y 2h antes, con opción de confirmar/cancelar respondiendo. Reduce no-shows (principal ROI para la clínica).
