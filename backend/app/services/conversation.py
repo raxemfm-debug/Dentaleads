@@ -52,6 +52,60 @@ _MESES_ES = [
     "julio", "agosto", "septiembre", "octubre", "noviembre", "diciembre",
 ]
 
+_DIAS_SEMANA_EN = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"]
+_DIAS_ABBR_ES = {
+    "monday": "Lun", "tuesday": "Mar", "wednesday": "Mié", "thursday": "Jue",
+    "friday": "Vie", "saturday": "Sáb", "sunday": "Dom",
+}
+
+
+def _format_hora_12h(hhmm: str) -> str:
+    """"09:00" -> "9:00 a.m.", "19:00" -> "7:00 p.m."."""
+    h, m = map(int, hhmm.split(":"))
+    periodo = "a.m." if h < 12 else "p.m."
+    h12 = h % 12 or 12
+    return f"{h12}:{m:02d} {periodo}"
+
+
+def _format_horario_atencion(business_hours: dict) -> str | None:
+    """Humanize clinics.business_hours (the same JSONB AvailabilityService reads) into
+    Spanish, grouping consecutive days that share an identical schedule — e.g. the real
+    shape seen in prod, {"monday": [{"from":"09:00","to":"13:00"},{"from":"15:00","to":"19:00"}], ...,
+    "sunday": []}, renders as "Lun-Vie 9:00 a.m.-1:00 p.m. y 3:00 p.m.-7:00 p.m., Sáb 9:00
+    a.m.-1:00 p.m., Dom Cerrado".
+
+    Returns None when no schedule is configured at all, so the caller omits the field
+    entirely — same "admit it, don't invent" pattern as _format_ficha_clinica's other
+    fields — instead of rendering a schedule that doesn't exist.
+    """
+    days: dict = business_hours.get("days") or {}
+    if not days:
+        return None
+
+    grupos: list[str] = []
+    i = 0
+    while i < len(_DIAS_SEMANA_EN):
+        dia = _DIAS_SEMANA_EN[i]
+        rangos = days.get(dia) or []
+        firma = tuple((r["from"], r["to"]) for r in rangos)
+        j = i
+        while (
+            j + 1 < len(_DIAS_SEMANA_EN)
+            and tuple((r["from"], r["to"]) for r in (days.get(_DIAS_SEMANA_EN[j + 1]) or [])) == firma
+        ):
+            j += 1
+        etiqueta = (
+            _DIAS_ABBR_ES[dia] if j == i
+            else f"{_DIAS_ABBR_ES[dia]}-{_DIAS_ABBR_ES[_DIAS_SEMANA_EN[j]]}"
+        )
+        horas = (
+            " y ".join(f"{_format_hora_12h(r['from'])}-{_format_hora_12h(r['to'])}" for r in rangos)
+            if rangos else "Cerrado"
+        )
+        grupos.append(f"{etiqueta} {horas}")
+        i = j + 1
+    return ", ".join(grupos)
+
 
 def _format_fecha_actual(now: datetime, tz_name: str) -> str:
     dia = _DIAS_ES[now.weekday()]
@@ -75,11 +129,18 @@ def _format_ficha_clinica(clinic: Clinic) -> str:
     """Compose the "Ficha de la clínica" block injected into the system prompt.
 
     Only lists fields actually configured on the clinic. The model must never
-    invent a missing address/maps link/phone (health-adjacent trust context) —
-    it must say so honestly and offer to derive to a human instead.
+    invent a missing address/maps link/phone/horario (health-adjacent trust
+    context) — it must say so honestly and offer to derive to a human instead.
+
+    Horario de atención is rendered from clinic.business_hours — the same JSONB
+    AvailabilityService reads for verificar_disponibilidad/agendar_cita — via
+    _format_horario_atencion. Without this, the model had no way to answer a
+    general "¿atienden los domingos?" from data that already existed, and fell
+    back to the (correct, but avoidable) "no tengo ese dato" honesty path.
     """
     campos = [
         ("Dirección", clinic.address),
+        ("Horario de atención", _format_horario_atencion(clinic.business_hours or {})),
         ("Referencia", clinic.address_reference),
         ("Cómo llegar (Google Maps)", clinic.maps_url),
         ("Teléfono de contacto", clinic.contact_phone),
@@ -89,9 +150,13 @@ def _format_ficha_clinica(clinic: Clinic) -> str:
     return (
         "Ficha de la clínica:\n"
         f"{cuerpo}\n"
-        "Si el paciente pregunta por la ubicación y falta algún dato de esta ficha, "
-        "dilo honestamente y ofrece derivar a un humano para confirmarlo. Nunca "
-        "inventes una dirección, un link de Maps o un teléfono que no esté aquí."
+        "Si el paciente pregunta por la ubicación o el horario de atención y falta algún "
+        "dato de esta ficha, dilo honestamente y ofrece derivar a un humano para "
+        "confirmarlo. Nunca inventes una dirección, un link de Maps, un teléfono o un "
+        "horario que no esté aquí. Preguntas generales de horario (qué días atienden, si "
+        "abren un día en particular, a qué hora abren o cierran) respóndelas directamente "
+        "desde este horario, sin usar herramientas — usa verificar_disponibilidad solo "
+        "para confirmar turnos libres en una fecha específica."
     )
 
 

@@ -599,7 +599,7 @@ def test_system_prompt_contains_ficha_clinica_for_correct_tenant():
     assert "- Referencia: Frente a la plaza principal" in prompt
     assert "- Cómo llegar (Google Maps): https://maps.app.goo.gl/ejemplo" in prompt
     assert "- Teléfono de contacto: +51 1 111 2222" in prompt
-    assert "Nunca inventes una dirección, un link de Maps o un teléfono" in prompt
+    assert "Nunca inventes una dirección, un link de Maps, un teléfono o un horario" in prompt
 
 
 def test_system_prompt_ficha_clinica_isolated_per_tenant():
@@ -634,8 +634,84 @@ def test_system_prompt_ficha_clinica_sin_datos_de_ubicacion():
 
     assert "Ficha de la clínica:" in prompt
     assert "(Sin datos de ubicación configurados todavía.)" in prompt
-    assert "Nunca inventes una dirección, un link de Maps o un teléfono" in prompt
+    assert "Nunca inventes una dirección, un link de Maps, un teléfono o un horario" in prompt
     assert "dilo honestamente y ofrece derivar a un humano" in prompt
+    assert "Horario de atención" not in prompt
+
+
+# ---------------------------------------------------------------------------
+# System prompt — ficha de la clínica: horario de atención (DT: "¿atienden
+# domingos?" respondía "no tengo ese dato" con business_hours ya configurado)
+# ---------------------------------------------------------------------------
+
+def test_system_prompt_ficha_clinica_incluye_horario_agrupado_simple():
+    clinic = Clinic(
+        name="Clínica Test",
+        whatsapp_phone_id="phone-horario-simple",
+        config={},
+        business_hours={
+            "slot_duration_minutes": 30,
+            "days": {
+                "monday": [{"from": "09:00", "to": "19:00"}],
+                "tuesday": [{"from": "09:00", "to": "19:00"}],
+                "wednesday": [{"from": "09:00", "to": "19:00"}],
+                "thursday": [{"from": "09:00", "to": "19:00"}],
+                "friday": [{"from": "09:00", "to": "19:00"}],
+                "saturday": [{"from": "09:00", "to": "13:00"}],
+                "sunday": [{"from": "09:00", "to": "13:00"}],
+            },
+        },
+    )
+
+    prompt = _build_system_prompt(clinic)
+
+    assert (
+        "- Horario de atención: Lun-Vie 9:00 a.m.-7:00 p.m., Sáb-Dom 9:00 a.m.-1:00 p.m."
+        in prompt
+    )
+
+
+def test_system_prompt_ficha_clinica_horario_con_franja_partida_y_dia_cerrado():
+    """Misma forma real que la clínica de producción: franja partida por almuerzo
+    de lunes a viernes, sábado solo mañana, domingo cerrado."""
+    clinic = Clinic(
+        name="Clínica Dental Demo",
+        whatsapp_phone_id="phone-horario-real",
+        config={},
+        business_hours={
+            "slot_duration_minutes": 30,
+            "days": {
+                "monday": [{"from": "09:00", "to": "13:00"}, {"from": "15:00", "to": "19:00"}],
+                "tuesday": [{"from": "09:00", "to": "13:00"}, {"from": "15:00", "to": "19:00"}],
+                "wednesday": [{"from": "09:00", "to": "13:00"}, {"from": "15:00", "to": "19:00"}],
+                "thursday": [{"from": "09:00", "to": "13:00"}, {"from": "15:00", "to": "19:00"}],
+                "friday": [{"from": "09:00", "to": "13:00"}, {"from": "15:00", "to": "19:00"}],
+                "saturday": [{"from": "09:00", "to": "13:00"}],
+                "sunday": [],
+            },
+        },
+    )
+
+    prompt = _build_system_prompt(clinic)
+
+    assert "Lun-Vie 9:00 a.m.-1:00 p.m. y 3:00 p.m.-7:00 p.m." in prompt
+    assert "Sáb 9:00 a.m.-1:00 p.m." in prompt
+    assert "Dom Cerrado" in prompt
+
+
+def test_system_prompt_ficha_clinica_sin_business_hours_horario_omitido():
+    """Sin business_hours configurado, el bot debe admitirlo, no inventar un horario."""
+    clinic = Clinic(
+        name="Clínica Sin Horario",
+        whatsapp_phone_id="phone-sin-horario",
+        address="Av. Siempre Viva 742",
+        config={},
+    )
+
+    prompt = _build_system_prompt(clinic)
+
+    assert "Horario de atención" not in prompt
+    assert "un teléfono o un horario que no esté aquí" in prompt
 
 
 # ---------------------------------------------------------------------------
@@ -706,3 +782,43 @@ async def test_handle_ficha_paciente_sin_datos_para_lead_nuevo(db_session, clini
     system_prompt = provider.calls[0]["system_prompt"]
     assert "Ficha del paciente:" in system_prompt
     assert "(Sin datos guardados todavía para este número.)" in system_prompt
+
+
+# ---------------------------------------------------------------------------
+# handle() end-to-end — horario de atención respondido desde la ficha
+# ---------------------------------------------------------------------------
+
+async def test_handle_pregunta_de_horario_llega_a_la_ficha_sin_tool(db_session):
+    clinic_con_horario = Clinic(
+        name="Clínica Dental Demo",
+        whatsapp_phone_id="phone-horario-e2e",
+        config={},
+        business_hours={
+            "slot_duration_minutes": 30,
+            "days": {
+                "monday": [{"from": "09:00", "to": "13:00"}, {"from": "15:00", "to": "19:00"}],
+                "tuesday": [{"from": "09:00", "to": "13:00"}, {"from": "15:00", "to": "19:00"}],
+                "wednesday": [{"from": "09:00", "to": "13:00"}, {"from": "15:00", "to": "19:00"}],
+                "thursday": [{"from": "09:00", "to": "13:00"}, {"from": "15:00", "to": "19:00"}],
+                "friday": [{"from": "09:00", "to": "13:00"}, {"from": "15:00", "to": "19:00"}],
+                "saturday": [{"from": "09:00", "to": "13:00"}],
+                "sunday": [],
+            },
+        },
+    )
+    db_session.add(clinic_con_horario)
+    await db_session.flush()
+
+    provider = SequencedFakeLLMProvider(
+        [_end_turn_response("No, los domingos no atendemos. ¡Pero sí de lunes a sábado!")]
+    )
+
+    await handle(
+        _msg(phone_id="phone-horario-e2e", text="¿atienden los domingos?"),
+        db_session, FakeMessagingProvider(), provider,
+    )
+
+    system_prompt = provider.calls[0]["system_prompt"]
+    assert "- Horario de atención:" in system_prompt
+    assert "Dom Cerrado" in system_prompt
+    assert "sin usar herramientas" in system_prompt
