@@ -129,6 +129,7 @@ class WhatsAppProvider(MessagingProvider):
                             text=text,
                             message_type=msg_type,
                             raw_payload=msg,
+                            timestamp=int(msg.get("timestamp", 0)),
                         )
                     )
         return results

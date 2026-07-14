@@ -22,6 +22,7 @@ class InboundMessage:
     text: str | None
     message_type: str      # text | button | list_reply | image | ...
     raw_payload: dict
+    timestamp: int = 0     # epoch seconds the user sent it (Meta's `timestamp` field)
 
 
 @dataclass

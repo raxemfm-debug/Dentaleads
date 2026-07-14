@@ -8,18 +8,20 @@ mocked so no network is touched.
 import hashlib
 import hmac as _hmac
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
 from sqlalchemy import select
 
+from app.config import settings
 from app.core.providers import LLMMessage, LLMProvider, LLMProviderError, LLMResponse, LLMTool
 from app.main import app
 from app.models.clinic import Clinic
 from app.models.message import Message
 from app.services.llm import get_llm_provider
-from tests.fakes import FakeLLMProvider
+from tests.fakes import FakeLLMProvider, SpyFakeLLMProvider
 
 # WHATSAPP_APP_SECRET test default set in tests/conftest.py before app import.
 _APP_SECRET = "test-app-secret"
@@ -31,7 +33,9 @@ def _sign(body: bytes) -> str:
     return f"sha256={digest}"
 
 
-def _text_payload(text: str, from_number: str = "15559990000") -> dict:
+def _text_payload(text: str, from_number: str = "15559990000", timestamp: int | None = None) -> dict:
+    if timestamp is None:
+        timestamp = int(time.time())
     return {
         "object": "whatsapp_business_account",
         "entry": [{
@@ -43,7 +47,7 @@ def _text_payload(text: str, from_number: str = "15559990000") -> dict:
                     "messages": [{
                         "from": from_number,
                         "id": "wamid.inbound-err-001",
-                        "timestamp": "1700000000",
+                        "timestamp": str(timestamp),
                         "type": "text",
                         "text": {"body": text},
                     }],
@@ -95,6 +99,15 @@ def failing_llm_provider():
 def fake_llm_provider():
     app.dependency_overrides[get_llm_provider] = lambda: FakeLLMProvider()
     yield
+    app.dependency_overrides.pop(get_llm_provider, None)
+
+
+@pytest.fixture
+def spy_llm_provider():
+    """Like fake_llm_provider but exposes .calls so tests can assert zero LLM invocations."""
+    provider = SpyFakeLLMProvider()
+    app.dependency_overrides[get_llm_provider] = lambda: provider
+    yield provider
     app.dependency_overrides.pop(get_llm_provider, None)
 
 
@@ -184,5 +197,103 @@ async def test_duplicate_wamid_processed_once(
     assert second.status_code == 200
     assert mock_whatsapp_send.post.await_count == 1
 
+    msgs = (await db_session.execute(select(Message))).scalars().all()
+    assert len(msgs) == 2
+
+
+# ---------------------------------------------------------------------------
+# Stale message guard (WEBHOOK_MAX_MESSAGE_AGE_SECONDS)
+# ---------------------------------------------------------------------------
+
+async def test_fresh_message_is_processed_normally(
+    client, db_session, mock_whatsapp_send, spy_llm_provider
+):
+    clinic = Clinic(name="Clínica Fresh Test", whatsapp_phone_id=_PHONE_NUMBER_ID, config={})
+    db_session.add(clinic)
+    await db_session.flush()
+
+    body = json.dumps(_text_payload("Hola, ¿tienen turno hoy?", from_number="15556660000")).encode()
+    response = await client.post(
+        "/webhook/whatsapp",
+        content=body,
+        headers={"X-Hub-Signature-256": _sign(body), "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200
+    assert len(spy_llm_provider.calls) == 1
+    msgs = (await db_session.execute(select(Message))).scalars().all()
+    assert len(msgs) == 2
+
+
+async def test_stale_message_is_skipped_without_processing(
+    client, db_session, mock_whatsapp_send, spy_llm_provider
+):
+    """A redelivery of a message older than the threshold must return 200 without
+    touching the LLM or persisting anything — it's an orphaned retry, not a live turn."""
+    clinic = Clinic(name="Clínica Stale Test", whatsapp_phone_id=_PHONE_NUMBER_ID, config={})
+    db_session.add(clinic)
+    await db_session.flush()
+
+    stale_timestamp = int(time.time()) - 7200  # 2 hours old
+    body = json.dumps(
+        _text_payload("Hola, ¿tienen turno mañana?", from_number="15556661111", timestamp=stale_timestamp)
+    ).encode()
+    response = await client.post(
+        "/webhook/whatsapp",
+        content=body,
+        headers={"X-Hub-Signature-256": _sign(body), "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert spy_llm_provider.calls == []
+    mock_whatsapp_send.post.assert_not_awaited()
+    msgs = (await db_session.execute(select(Message))).scalars().all()
+    assert len(msgs) == 0
+
+
+async def test_message_just_under_threshold_is_processed(
+    client, db_session, mock_whatsapp_send, spy_llm_provider
+):
+    clinic = Clinic(name="Clínica Threshold Test", whatsapp_phone_id=_PHONE_NUMBER_ID, config={})
+    db_session.add(clinic)
+    await db_session.flush()
+
+    fresh_timestamp = int(time.time()) - (settings.webhook_max_message_age_seconds - 5)
+    body = json.dumps(
+        _text_payload("Hola, ¿cuánto cuesta la limpieza?", from_number="15556662222", timestamp=fresh_timestamp)
+    ).encode()
+    response = await client.post(
+        "/webhook/whatsapp",
+        content=body,
+        headers={"X-Hub-Signature-256": _sign(body), "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200
+    assert len(spy_llm_provider.calls) == 1
+    msgs = (await db_session.execute(select(Message))).scalars().all()
+    assert len(msgs) == 2
+
+
+async def test_message_with_missing_timestamp_is_processed(
+    client, db_session, mock_whatsapp_send, spy_llm_provider
+):
+    """timestamp=0 (Meta omitted the field) must fail open and be processed — treating
+    an unknown age as stale would silently drop a real patient message."""
+    clinic = Clinic(name="Clínica No Timestamp Test", whatsapp_phone_id=_PHONE_NUMBER_ID, config={})
+    db_session.add(clinic)
+    await db_session.flush()
+
+    body = json.dumps(
+        _text_payload("Hola, ¿tienen turno?", from_number="15556663333", timestamp=0)
+    ).encode()
+    response = await client.post(
+        "/webhook/whatsapp",
+        content=body,
+        headers={"X-Hub-Signature-256": _sign(body), "Content-Type": "application/json"},
+    )
+
+    assert response.status_code == 200
+    assert len(spy_llm_provider.calls) == 1
     msgs = (await db_session.execute(select(Message))).scalars().all()
     assert len(msgs) == 2

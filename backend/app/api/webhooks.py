@@ -6,6 +6,7 @@ so that none of that logic lives in the router.
 """
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response, status
@@ -15,7 +16,7 @@ from app.config import settings
 from app.core.database import get_db
 from app.core.exceptions import TenantNotFoundError
 from app.core.providers import LLMProvider
-from app.services.conversation import handle, is_wamid_processed
+from app.services.conversation import handle, is_message_stale, is_wamid_processed
 from app.services.llm import get_llm_provider
 from app.services.whatsapp import WhatsAppProvider
 
@@ -65,6 +66,7 @@ async def whatsapp_inbound(
     payload = json.loads(body)
     messages = provider.parse_inbound(payload)
 
+    now_utc = datetime.now(timezone.utc)
     for msg in messages:
         logger.info(
             "inbound message tenant_phone_id=%s from=%s type=%s id=%s",
@@ -73,6 +75,13 @@ async def whatsapp_inbound(
             msg.message_type,
             msg.message_id,
         )
+        if is_message_stale(msg.timestamp, settings.webhook_max_message_age_seconds, now=now_utc):
+            logger.warning(
+                "stale inbound message wamid=%s age_seconds=%.0f — skipping (orphaned redelivery)",
+                msg.message_id,
+                now_utc.timestamp() - msg.timestamp,
+            )
+            continue
         if await is_wamid_processed(db, msg.message_id):
             logger.info("duplicate wamid=%s — already processed, skipping", msg.message_id)
             continue

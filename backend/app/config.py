@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     whatsapp_app_secret: str
     whatsapp_access_token: str
 
+    # Webhook
+    webhook_max_message_age_seconds: int = 900
+
     # Auth
     jwt_secret: str
 

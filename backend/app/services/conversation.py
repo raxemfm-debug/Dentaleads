@@ -246,6 +246,30 @@ def _build_system_prompt(
     return "\n\n".join(partes)
 
 
+def is_message_stale(
+    timestamp: int,
+    max_age_seconds: int,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """True when a WhatsApp message's send timestamp is older than max_age_seconds.
+
+    Meta redelivers a webhook when it considers a previous delivery failed (e.g. the
+    DT-004 expired-token outage); by the time the redelivery arrives the patient may
+    have moved on, so replaying it through the LLM would produce a stale, out-of-context
+    reply. Callers must check this before invoking handle() and must still return 200
+    for a stale message — a non-2xx response only makes Meta keep retrying it.
+
+    Fails open on a missing/invalid timestamp (<= 0, e.g. parse_inbound's default when
+    Meta omits the field): treating an unknown age as stale would silently drop a real
+    patient message, which is worse than occasionally replaying an odd redelivery.
+    """
+    if timestamp <= 0:
+        return False
+    now = now or datetime.now(timezone.utc)
+    return now.timestamp() - timestamp > max_age_seconds
+
+
 async def is_wamid_processed(db: AsyncSession, wamid: str) -> bool:
     """True if a message with this WhatsApp message id (wamid) was already persisted.
 
