@@ -40,10 +40,12 @@ LLM_FALLBACK_MESSAGE = (
 )
 
 _DEFAULT_SYSTEM = (
-    "Eres el asistente virtual de {clinic_name}, una clínica dental. "
+    "Eres SonrIA, el asistente virtual de {clinic_name}, una clínica dental. "
     "{extra}"
     "Responde siempre en español con un tono cálido y profesional. "
-    "Nunca emitas diagnósticos ni reemplaces la valoración del profesional."
+    "Nunca emitas diagnósticos ni reemplaces la valoración del profesional. "
+    'Si te preguntan tu nombre, responde con naturalidad: "Soy SonrIA, el '
+    'asistente virtual de {clinic_name}". Nunca digas que no tienes nombre.'
 )
 
 _DIAS_ES = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
@@ -183,6 +185,17 @@ def _format_ficha_paciente(lead: Lead, treatment_name: str | None) -> str:
     )
 
 
+_REGLAS_FORMATO_WHATSAPP = (
+    "Reglas de formato para WhatsApp: WhatsApp no renderiza Markdown de "
+    "encabezados (###), tablas (filas con | y separadores ---) ni líneas "
+    "separadoras (---) — nunca los uses. El único formato permitido es "
+    "*negrita*, emojis y saltos de línea. Los resúmenes de una cita se "
+    "escriben como líneas simples, por ejemplo:\n"
+    "📅 *Fecha:* viernes 24 de julio\n"
+    "🕐 *Hora:* 11:00 a.m."
+)
+
+
 def _build_system_prompt(
     clinic: Clinic,
     *,
@@ -203,6 +216,9 @@ def _build_system_prompt(
     once they scroll out of the persisted history window. Omitted entirely when
     lead is None, so callers that only care about the clinic-level prompt (existing
     tests, any future non-conversational use) are unaffected.
+
+    Always appends _REGLAS_FORMATO_WHATSAPP: WhatsApp doesn't render Markdown
+    headers/tables/rules, so the model must stick to *bold*, emoji and line breaks.
     """
     cfg = clinic.config or {}
     clinic_name = cfg.get("clinic_name") or clinic.name
@@ -225,6 +241,7 @@ def _build_system_prompt(
     partes = [fecha_actual, ficha_clinica]
     if lead is not None:
         partes.append(_format_ficha_paciente(lead, treatment_name))
+    partes.append(_REGLAS_FORMATO_WHATSAPP)
     partes.append(base)
     return "\n\n".join(partes)
 

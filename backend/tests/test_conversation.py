@@ -750,6 +750,47 @@ def test_system_prompt_omits_ficha_paciente_without_lead():
 
 
 # ---------------------------------------------------------------------------
+# System prompt — identidad (SonrIA) y reglas de formato de WhatsApp
+# ---------------------------------------------------------------------------
+
+def test_system_prompt_contains_sonria_identity():
+    clinic = Clinic(name="Clínica Test", whatsapp_phone_id="phone-sonria", config={})
+
+    prompt = _build_system_prompt(clinic)
+
+    assert "Eres SonrIA, el asistente virtual de Clínica Test" in prompt
+    assert 'Soy SonrIA, el asistente virtual de Clínica Test' in prompt
+    assert "Nunca digas que no tienes nombre" in prompt
+
+
+def test_system_prompt_sonria_identity_uses_configured_clinic_name():
+    """clinic_name en config debe ganarle al name de la fila, igual que el resto de la ficha."""
+    clinic = Clinic(
+        name="Razón Social SAC", whatsapp_phone_id="phone-sonria-2",
+        config={"clinic_name": "Sonrisas del Sur"},
+    )
+
+    prompt = _build_system_prompt(clinic)
+
+    assert "Eres SonrIA, el asistente virtual de Sonrisas del Sur" in prompt
+    assert "Soy SonrIA, el asistente virtual de Sonrisas del Sur" in prompt
+
+
+def test_system_prompt_contains_reglas_formato_whatsapp():
+    clinic = Clinic(name="Clínica Test", whatsapp_phone_id="phone-formato", config={})
+
+    prompt = _build_system_prompt(clinic)
+
+    assert "no renderiza Markdown" in prompt
+    assert "###" in prompt
+    assert "tablas (filas con | y separadores ---)" in prompt
+    assert "líneas separadoras (---)" in prompt
+    assert "*negrita*" in prompt
+    assert "📅 *Fecha:* viernes 24 de julio" in prompt
+    assert "🕐 *Hora:* 11:00 a.m." in prompt
+
+
+# ---------------------------------------------------------------------------
 # handle() end-to-end — la ficha del paciente evita que el bot re-pida el
 # nombre cuando ya lo conoce para este número de WhatsApp.
 # ---------------------------------------------------------------------------
